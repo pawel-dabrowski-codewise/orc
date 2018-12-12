@@ -20,19 +20,20 @@ package org.apache.orc.impl;
 
 import io.airlift.compress.snappy.SnappyCompressor;
 import io.airlift.compress.snappy.SnappyDecompressor;
+import org.apache.orc.CompressionKind;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
 public class SnappyCodec extends AircompressorCodec
     implements DirectDecompressionCodec{
-  private static final HadoopShims SHIMS = HadoopShims.Factory.get();
+  private static final HadoopShims SHIMS = HadoopShimsFactory.get();
 
   Boolean direct = null;
   HadoopShims.DirectDecompressor decompressShim = null;
 
   SnappyCodec() {
-    super(new SnappyCompressor(), new SnappyDecompressor());
+    super(CompressionKind.SNAPPY, new SnappyCompressor(), new SnappyDecompressor());
   }
 
   @Override

@@ -21,6 +21,7 @@ package org.apache.orc.impl.writer;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.orc.OrcFile;
 import org.apache.orc.OrcProto;
+import org.apache.orc.PhysicalWriter;
 import org.apache.orc.impl.OutStream;
 import org.apache.orc.impl.StreamName;
 
@@ -84,6 +85,14 @@ public interface WriterContext {
      */
     OrcFile.Version getVersion();
 
+    /**
+     * Get the PhysicalWriter.
+     *
+     * @return the file's physical writer.
+     */
+    PhysicalWriter getPhysicalWriter();
+
+
     OrcFile.BloomFilterVersion getBloomFilterVersion();
 
     void writeIndex(StreamName name,
@@ -92,4 +101,8 @@ public interface WriterContext {
     void writeBloomFilter(StreamName name,
                           OrcProto.BloomFilterIndex.Builder bloom
                           ) throws IOException;
+
+    boolean getUseUTCTimestamp();
+
+    double getDictionaryKeySizeThreshold(int column);
 }

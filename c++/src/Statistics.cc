@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-#include "Exceptions.hh"
+#include "orc/Exceptions.hh"
 #include "RLE.hh"
 #include "Statistics.hh"
 
@@ -50,18 +50,21 @@ namespace orc {
   StatisticsImpl::StatisticsImpl(const proto::StripeStatistics& stripeStats,
                                  const StatContext& statContext) {
     for(int i = 0; i < stripeStats.colstats_size(); i++) {
-      colStats.push_back(convertColumnStatistics(stripeStats.colstats(i), statContext));
+      colStats.push_back(
+                convertColumnStatistics(stripeStats.colstats(i), statContext));
     }
   }
 
-  StatisticsImpl::StatisticsImpl(const proto::Footer& footer, const StatContext& statContext) {
+  StatisticsImpl::StatisticsImpl(const proto::Footer& footer,
+                                 const StatContext& statContext) {
     for(int i = 0; i < footer.statistics_size(); i++) {
-      colStats.push_back(convertColumnStatistics(footer.statistics(i), statContext));
+      colStats.push_back(
+                convertColumnStatistics(footer.statistics(i), statContext));
     }
   }
 
   StatisticsImpl::~StatisticsImpl() {
-    for(std::list<ColumnStatistics*>::iterator ptr = colStats.begin();
+    for(std::vector<ColumnStatistics*>::iterator ptr = colStats.begin();
         ptr != colStats.end();
         ++ptr) {
       delete *ptr;
@@ -80,9 +83,10 @@ namespace orc {
     // PASS
   }
 
-  StripeStatisticsImpl::StripeStatisticsImpl(const proto::StripeStatistics& stripeStats,
-                                 std::vector<std::vector<proto::ColumnStatistics> >& indexStats,
-                                 const StatContext& statContext) {
+  StripeStatisticsImpl::StripeStatisticsImpl(
+                const proto::StripeStatistics& stripeStats,
+                std::vector<std::vector<proto::ColumnStatistics> >& indexStats,
+                const StatContext& statContext) {
     columnStats.reset(new StatisticsImpl(stripeStats, statContext));
     rowIndexStats.resize(indexStats.size());
     for(size_t i = 0; i < rowIndexStats.size(); i++) {
@@ -131,6 +135,10 @@ namespace orc {
     // PASS
   }
 
+  MutableColumnStatistics::~MutableColumnStatistics() {
+    // PASS
+  }
+
   ColumnStatisticsImpl::~ColumnStatisticsImpl() {
     // PASS
   }
@@ -157,6 +165,18 @@ namespace orc {
 
   IntegerColumnStatisticsImpl::~IntegerColumnStatisticsImpl() {
     // PASS
+  }
+
+  void IntegerColumnStatisticsImpl::update(int64_t value, int repetitions) {
+    _stats.updateMinMax(value);
+
+    if (_stats.hasSum()) {
+      bool wasPositive = _stats.getSum() >= 0;
+      _stats.setSum(value * repetitions + _stats.getSum());
+      if ((value >= 0) == wasPositive) {
+        _stats.setHasSum((_stats.getSum() >= 0) == wasPositive);
+      }
+    }
   }
 
   StringColumnStatisticsImpl::~StringColumnStatisticsImpl() {
@@ -300,9 +320,11 @@ namespace orc {
     }else{
       const proto::TimestampStatistics& stats = pb.timestampstatistics();
       _stats.setHasMinimum(
-                  stats.has_minimumutc() || (stats.has_minimum() && (statContext.writerTimezone != NULL)));
+                stats.has_minimumutc() ||
+                (stats.has_minimum() && (statContext.writerTimezone != nullptr)));
       _stats.setHasMaximum(
-                  stats.has_maximumutc() || (stats.has_maximum() && (statContext.writerTimezone != NULL)));
+                stats.has_maximumutc() ||
+                (stats.has_maximum() && (statContext.writerTimezone != nullptr)));
       _hasLowerBound = stats.has_minimumutc() || stats.has_minimum();
       _hasUpperBound = stats.has_maximumutc() || stats.has_maximum();
 
@@ -314,12 +336,16 @@ namespace orc {
       } else if (statContext.writerTimezone) {
         int64_t writerTimeSec = stats.minimum() / 1000;
         // multiply the offset by 1000 to convert to millisecond
-        int64_t minimum = stats.minimum() + (statContext.writerTimezone->getVariant(writerTimeSec).gmtOffset) * 1000;
+        int64_t minimum =
+          stats.minimum() +
+            (statContext.writerTimezone->getVariant(writerTimeSec).gmtOffset)
+              * 1000;
         _stats.setMinimum(minimum);
         _lowerBound = minimum;
       } else {
         _stats.setMinimum(0);
-        // subtract 1 day 1 hour (25 hours) in milliseconds to handle unknown TZ and daylight savings
+        // subtract 1 day 1 hour (25 hours) in milliseconds to handle unknown
+        // TZ and daylight savings
         _lowerBound = stats.minimum() - (25 * SECONDS_PER_HOUR * 1000);
       }
 
@@ -331,12 +357,15 @@ namespace orc {
       } else if (statContext.writerTimezone) {
         int64_t writerTimeSec = stats.maximum() / 1000;
         // multiply the offset by 1000 to convert to millisecond
-        int64_t maximum = stats.maximum() + (statContext.writerTimezone->getVariant(writerTimeSec).gmtOffset) * 1000;
+        int64_t maximum = stats.maximum() +
+          (statContext.writerTimezone->getVariant(writerTimeSec).gmtOffset)
+            * 1000;
         _stats.setMaximum(maximum);
         _upperBound = maximum;
       } else {
         _stats.setMaximum(0);
-        // add 1 day 1 hour (25 hours) in milliseconds to handle unknown TZ and daylight savings
+        // add 1 day 1 hour (25 hours) in milliseconds to handle unknown
+        // TZ and daylight savings
         _upperBound = stats.maximum() +  (25 * SECONDS_PER_HOUR * 1000);
       }
       // Add 1 millisecond to account for microsecond precision of values
@@ -344,44 +373,44 @@ namespace orc {
     }
   }
 
-  std::unique_ptr<ColumnStatistics> createColumnStatistics(
-    const Type& type, bool enableStringComparison) {
+  std::unique_ptr<MutableColumnStatistics> createColumnStatistics(
+    const Type& type) {
     switch (static_cast<int64_t>(type.getKind())) {
       case BOOLEAN:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new BooleanColumnStatisticsImpl());
       case BYTE:
       case INT:
       case LONG:
       case SHORT:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new IntegerColumnStatisticsImpl());
       case STRUCT:
       case MAP:
       case LIST:
       case UNION:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new ColumnStatisticsImpl());
       case FLOAT:
       case DOUBLE:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new DoubleColumnStatisticsImpl());
       case BINARY:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new BinaryColumnStatisticsImpl());
       case STRING:
       case CHAR:
       case VARCHAR:
-        return std::unique_ptr<ColumnStatistics>(
-          new StringColumnStatisticsImpl(enableStringComparison));
+        return std::unique_ptr<MutableColumnStatistics>(
+          new StringColumnStatisticsImpl());
       case DATE:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new DateColumnStatisticsImpl());
       case TIMESTAMP:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new TimestampColumnStatisticsImpl());
       case DECIMAL:
-        return std::unique_ptr<ColumnStatistics>(
+        return std::unique_ptr<MutableColumnStatistics>(
           new DecimalColumnStatisticsImpl());
       default:
         throw NotImplementedYet("Not supported type: " + type.toString());

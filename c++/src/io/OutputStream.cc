@@ -16,12 +16,16 @@
  * limitations under the License.
  */
 
-#include "Exceptions.hh"
+#include "orc/Exceptions.hh"
 #include "OutputStream.hh"
 
 #include <sstream>
 
 namespace orc {
+
+  PositionRecorder::~PositionRecorder() {
+    // PASS
+  }
 
   BufferedOutputStream::BufferedOutputStream(
                                     MemoryPool& pool,
@@ -47,7 +51,7 @@ namespace orc {
       newCapacity += dataBuffer->capacity();
     }
     dataBuffer->reserve(newCapacity);
-    dataBuffer->resize(dataBuffer->size() + blockSize);
+    dataBuffer->resize(newSize);
     *buffer = dataBuffer->data() + oldSize;
     return true;
   }
@@ -88,7 +92,7 @@ namespace orc {
 
   uint64_t BufferedOutputStream::flush() {
     uint64_t dataSize = dataBuffer->size();
-    outputStream->write(dataBuffer->data(), dataBuffer->size());
+    outputStream->write(dataBuffer->data(), dataSize);
     dataBuffer->resize(0);
     return dataSize;
   }

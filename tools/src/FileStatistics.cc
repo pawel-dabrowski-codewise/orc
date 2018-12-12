@@ -17,7 +17,7 @@
  */
 
 #include "orc/ColumnPrinter.hh"
-#include "Exceptions.hh"
+#include "orc/Exceptions.hh"
 
 #include <getopt.h>
 #include <string>
@@ -29,7 +29,7 @@ void printStatistics(const char *filename, bool withIndex) {
 
   orc::ReaderOptions opts;
   std::unique_ptr<orc::Reader> reader;
-  reader = orc::createReader(orc::readLocalFile(std::string(filename)), opts);
+  reader = orc::createReader(orc::readFile(std::string(filename)), opts);
 
   // print out all selected columns statistics.
   std::unique_ptr<orc::Statistics> colStats = reader->getStatistics();
@@ -74,7 +74,7 @@ int main(int argc, char* argv[]) {
     {"withIndex", no_argument, ORC_NULLPTR, 'i'},
     {ORC_NULLPTR, 0, ORC_NULLPTR, 0}
   };
-  const char* filename = NULL;
+  const char* filename = ORC_NULLPTR;
   bool withIndex = false;
   bool helpFlag = false;
   int opt;

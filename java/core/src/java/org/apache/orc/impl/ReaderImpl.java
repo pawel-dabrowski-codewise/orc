@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -21,7 +21,6 @@ package org.apache.orc.impl;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -40,13 +39,13 @@ import org.apache.orc.CompressionCodec;
 import org.apache.orc.FileFormatException;
 import org.apache.orc.StripeInformation;
 import org.apache.orc.StripeStatistics;
+import org.apache.orc.UnknownFormatException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hive.common.io.DiskRange;
 import org.apache.hadoop.hive.ql.util.JavaDataModel;
 import org.apache.hadoop.io.Text;
 import org.apache.orc.OrcProto;
@@ -77,6 +76,7 @@ public class ReaderImpl implements Reader {
 
   private long deserializedSize = -1;
   protected final Configuration conf;
+  protected final boolean useUTCTimestamp;
   private final List<Integer> versionList;
   private final OrcFile.WriterVersion writerVersion;
 
@@ -135,7 +135,7 @@ public class ReaderImpl implements Reader {
 
   @Override
   public List<String> getMetadataKeys() {
-    List<String> result = new ArrayList<String>();
+    List<String> result = new ArrayList<>();
     for(OrcProto.UserMetadataItem item: userMetadata) {
       result.add(item.getName());
     }
@@ -221,13 +221,15 @@ public class ReaderImpl implements Reader {
 
   @Override
   public ColumnStatistics[] getStatistics() {
-    return deserializeStats(fileStats);
+    return deserializeStats(schema, fileStats);
   }
 
-  static ColumnStatistics[] deserializeStats(List<OrcProto.ColumnStatistics> fileStats){
+  public static ColumnStatistics[] deserializeStats(
+      TypeDescription schema,
+      List<OrcProto.ColumnStatistics> fileStats) {
     ColumnStatistics[] result = new ColumnStatistics[fileStats.size()];
     for(int i=0; i < result.length; ++i) {
-      result[i] = ColumnStatisticsImpl.deserialize(fileStats.get(i));
+      result[i] = ColumnStatisticsImpl.deserialize(schema, fileStats.get(i));
     }
     return result;
   }
@@ -244,7 +246,6 @@ public class ReaderImpl implements Reader {
    * @param path the filename for error messages
    * @param psLen the postscript length
    * @param buffer the tail of the file
-   * @throws IOException
    */
   protected static void ensureOrcFooter(FSDataInputStream in,
                                         Path path,
@@ -273,32 +274,6 @@ public class ReaderImpl implements Reader {
   }
 
   /**
-   * Ensure this is an ORC file to prevent users from trying to read text
-   * files or RC files as ORC files.
-   * @param psLen the postscript length
-   * @param buffer the tail of the file
-   * @throws IOException
-   */
-  protected static void ensureOrcFooter(ByteBuffer buffer, int psLen) throws IOException {
-    int magicLength = OrcFile.MAGIC.length();
-    int fullLength = magicLength + 1;
-    if (psLen < fullLength || buffer.remaining() < fullLength) {
-      throw new FileFormatException("Malformed ORC file. Invalid postscript length " + psLen);
-    }
-
-    int offset = buffer.arrayOffset() + buffer.position() + buffer.limit() - fullLength;
-    byte[] array = buffer.array();
-    // now look for the magic string at the end of the postscript.
-    if (!Text.decode(array, offset, magicLength).equals(OrcFile.MAGIC)) {
-      // if it isn't there, this may be 0.11.0 version of the ORC file.
-      // Read the first 3 bytes from the buffer to check for the header
-      if (!Text.decode(buffer.array(), 0, magicLength).equals(OrcFile.MAGIC)) {
-        throw new FileFormatException("Malformed ORC file. Invalid postscript length " + psLen);
-      }
-    }
-  }
-
-  /**
    * Build a version string out of an array.
    * @param version the version number as a list
    * @return the human readable form of the version string
@@ -317,25 +292,16 @@ public class ReaderImpl implements Reader {
   /**
    * Check to see if this ORC file is from a future version and if so,
    * warn the user that we may not be able to read all of the column encodings.
-   * @param log the logger to write any error message to
    * @param path the data source path for error messages
-   * @param version the version of hive that wrote the file.
+   * @param postscript the parsed postscript
    */
-  protected static void checkOrcVersion(Logger log, Path path,
-                                        List<Integer> version) {
-    if (version.size() >= 1) {
-      int major = version.get(0);
-      int minor = 0;
-      if (version.size() >= 2) {
-        minor = version.get(1);
-      }
-      if (major > OrcFile.Version.CURRENT.getMajor() ||
-          (major == OrcFile.Version.CURRENT.getMajor() &&
-           minor > OrcFile.Version.CURRENT.getMinor())) {
-        log.warn(path + " was written by a future Hive version " +
-                 versionString(version) +
-                 ". This file may not be readable by this version of Hive.");
-      }
+  protected static void checkOrcVersion(Path path,
+                                        OrcProto.PostScript postscript
+                                        ) throws IOException {
+    List<Integer> version = postscript.getVersionList();
+    if (getFileVersion(version) == OrcFile.Version.FUTURE) {
+      throw new UnknownFormatException(path, versionString(version),
+          postscript);
     }
   }
 
@@ -343,7 +309,6 @@ public class ReaderImpl implements Reader {
   * Constructor that let's the user specify additional options.
    * @param path pathname for file
    * @param options options for reading
-   * @throws IOException
    */
   public ReaderImpl(Path path, OrcFile.ReaderOptions options) throws IOException {
     FileSystem fs = options.getFilesystem();
@@ -354,6 +319,7 @@ public class ReaderImpl implements Reader {
     this.path = path;
     this.conf = options.getConfiguration();
     this.maxLength = options.getMaxLength();
+    this.useUTCTimestamp = options.getUseUTCTimestamp();
     FileMetadata fileMetadata = options.getFileMetadata();
     if (fileMetadata != null) {
       this.compressionKind = fileMetadata.getCompressionKind();
@@ -378,6 +344,7 @@ public class ReaderImpl implements Reader {
         tail = extractFileTail(fs, path, options.getMaxLength());
         options.orcTail(tail);
       } else {
+        checkOrcVersion(path, orcTail.getPostScript());
         tail = orcTail;
       }
       this.compressionKind = tail.getCompressionKind();
@@ -394,6 +361,7 @@ public class ReaderImpl implements Reader {
       this.stripes = tail.getStripes();
       this.stripeStats = tail.getStripeStatisticsProto();
     }
+    OrcUtils.isValidTypeTree(this.types, 0);
     this.schema = OrcUtils.convertTypeFromProtobuf(this.types, 0);
   }
 
@@ -411,26 +379,20 @@ public class ReaderImpl implements Reader {
     return OrcFile.WriterVersion.FUTURE;
   }
 
-  static List<DiskRange> singleton(DiskRange item) {
-    List<DiskRange> result = new ArrayList<>();
-    result.add(item);
-    return result;
-  }
-
   private static OrcProto.Footer extractFooter(ByteBuffer bb, int footerAbsPos,
-      int footerSize, CompressionCodec codec, int bufferSize) throws IOException {
+      int footerSize, InStream.StreamOptions options) throws IOException {
     bb.position(footerAbsPos);
     bb.limit(footerAbsPos + footerSize);
-    return OrcProto.Footer.parseFrom(InStream.createCodedInputStream("footer",
-        singleton(new BufferChunk(bb, 0)), footerSize, codec, bufferSize));
+    return OrcProto.Footer.parseFrom(InStream.createCodedInputStream(
+        InStream.create("footer", new BufferChunk(bb, 0), footerSize, options)));
   }
 
   public static OrcProto.Metadata extractMetadata(ByteBuffer bb, int metadataAbsPos,
-      int metadataSize, CompressionCodec codec, int bufferSize) throws IOException {
+      int metadataSize, InStream.StreamOptions options) throws IOException {
     bb.position(metadataAbsPos);
     bb.limit(metadataAbsPos + metadataSize);
-    return OrcProto.Metadata.parseFrom(InStream.createCodedInputStream("metadata",
-        singleton(new BufferChunk(bb, 0)), metadataSize, codec, bufferSize));
+    return OrcProto.Metadata.parseFrom(InStream.createCodedInputStream(
+        InStream.create("metadata", new BufferChunk(bb, 0), metadataSize, options)));
   }
 
   private static OrcProto.PostScript extractPostScript(ByteBuffer bb, Path path,
@@ -440,7 +402,7 @@ public class ReaderImpl implements Reader {
     CodedInputStream in = CodedInputStream.newInstance(
         bb.array(), bb.arrayOffset() + psAbsOffset, psLen);
     OrcProto.PostScript ps = OrcProto.PostScript.parseFrom(in);
-    checkOrcVersion(LOG, path, ps.getVersionList());
+    checkOrcVersion(path, ps);
 
     // Check compression codec.
     switch (ps.getCompression()) {
@@ -456,49 +418,47 @@ public class ReaderImpl implements Reader {
     return ps;
   }
 
-  public static OrcTail extractFileTail(ByteBuffer buffer)
-      throws IOException {
-    return extractFileTail(buffer, -1, -1);
-  }
+  /**
+   * Build a virtual OrcTail for empty files.
+   * @return a new OrcTail
+   */
+  OrcTail buildEmptyTail() {
+    OrcProto.PostScript.Builder postscript = OrcProto.PostScript.newBuilder();
+    OrcFile.Version version = OrcFile.Version.CURRENT;
+    postscript.setMagic(OrcFile.MAGIC)
+        .setCompression(OrcProto.CompressionKind.NONE)
+        .setFooterLength(0)
+        .addVersion(version.getMajor())
+        .addVersion(version.getMinor())
+        .setMetadataLength(0)
+        .setWriterVersion(OrcFile.CURRENT_WRITER.getId());
 
-  public static OrcTail extractFileTail(ByteBuffer buffer, long fileLength, long modificationTime)
-      throws IOException {
-    int readSize = buffer.limit();
-    int psLen = buffer.get(readSize - 1) & 0xff;
-    int psOffset = readSize - 1 - psLen;
-    ensureOrcFooter(buffer, psLen);
-    byte[] psBuffer = new byte[psLen];
-    System.arraycopy(buffer.array(), psOffset, psBuffer, 0, psLen);
-    OrcProto.PostScript ps = OrcProto.PostScript.parseFrom(psBuffer);
-    int footerSize = (int) ps.getFooterLength();
-    CompressionKind kind = CompressionKind.valueOf(ps.getCompression().name());
-    OrcProto.FileTail.Builder fileTailBuilder = null;
-    CompressionCodec codec = OrcCodecPool.getCodec(kind);
-    try {
-      OrcProto.Footer footer = extractFooter(buffer,
-        (int) (buffer.position() + ps.getMetadataLength()),
-        footerSize, codec, (int) ps.getCompressionBlockSize());
-      fileTailBuilder = OrcProto.FileTail.newBuilder()
-        .setPostscriptLength(psLen)
-        .setPostscript(ps)
-        .setFooter(footer)
-        .setFileLength(fileLength);
-    } finally {
-      OrcCodecPool.returnCodec(kind, codec);
-    }
-    // clear does not clear the contents but sets position to 0 and limit = capacity
-    buffer.clear();
-    return new OrcTail(fileTailBuilder.build(), buffer.slice(), modificationTime);
+    // Use a struct with no fields
+    OrcProto.Type.Builder struct = OrcProto.Type.newBuilder();
+    struct.setKind(OrcProto.Type.Kind.STRUCT);
+
+    OrcProto.Footer.Builder footer = OrcProto.Footer.newBuilder();
+    footer.setHeaderLength(0)
+          .setContentLength(0)
+          .addTypes(struct)
+          .setNumberOfRows(0)
+          .setRowIndexStride(0);
+
+    OrcProto.FileTail.Builder result = OrcProto.FileTail.newBuilder();
+    result.setFooter(footer);
+    result.setPostscript(postscript);
+    result.setFileLength(0);
+    result.setPostscriptLength(0);
+    return new OrcTail(result.build(), null);
   }
 
   protected OrcTail extractFileTail(FileSystem fs, Path path,
       long maxFileLength) throws IOException {
-    FSDataInputStream file = fs.open(path);
     ByteBuffer buffer;
     OrcProto.PostScript ps;
     OrcProto.FileTail.Builder fileTailBuilder = OrcProto.FileTail.newBuilder();
     long modificationTime;
-    try {
+    try (FSDataInputStream file = fs.open(path)) {
       // figure out the size of the file using the option or filesystem
       long size;
       if (maxFileLength == Long.MAX_VALUE) {
@@ -509,10 +469,15 @@ public class ReaderImpl implements Reader {
         size = maxFileLength;
         modificationTime = -1;
       }
-      // Anything lesser than MAGIC header cannot be valid (valid ORC file is actually around 45 bytes, this is
-      // more conservative)
-      if (size <= OrcFile.MAGIC.length()) {
-        throw new FileFormatException("Not a valid ORC file");
+      if (size == 0) {
+        // Hive often creates empty files (including ORC) and has an
+        // optimization to create a 0 byte file as an empty ORC file.
+        return buildEmptyTail();
+      } else if (size <= OrcFile.MAGIC.length()) {
+        // Anything smaller than MAGIC header cannot be valid (valid ORC files
+	// are actually around 40 bytes, this is more conservative)
+        throw new FileFormatException("Not a valid ORC file " + path
+          + " (maxFileLength= " + maxFileLength + ")");
       }
       fileTailBuilder.setFileLength(size);
 
@@ -564,20 +529,15 @@ public class ReaderImpl implements Reader {
       buffer.position(footerOffset);
       ByteBuffer footerBuffer = buffer.slice();
       buffer.reset();
-      OrcProto.Footer footer = null;
+      OrcProto.Footer footer;
       CompressionCodec codec = OrcCodecPool.getCodec(compressionKind);
       try {
-        footer = extractFooter(footerBuffer, 0, footerSize, codec, bufferSize);
+        footer = extractFooter(footerBuffer, 0, footerSize,
+            InStream.options().withCodec(codec).withBufferSize(bufferSize));
       } finally {
         OrcCodecPool.returnCodec(compressionKind, codec);
       }
       fileTailBuilder.setFooter(footer);
-    } finally {
-      try {
-        file.close();
-      } catch (IOException ex) {
-        LOG.error("Failed to close the file after another error", ex);
-      }
     }
 
     ByteBuffer serializedTail = ByteBuffer.allocate(buffer.remaining());
@@ -762,7 +722,8 @@ public class ReaderImpl implements Reader {
     if (metadata == null) {
       CompressionCodec codec = OrcCodecPool.getCodec(compressionKind);
       try {
-        metadata = extractMetadata(tail.getSerializedTail(), 0, metadataSize, codec, bufferSize);
+        metadata = extractMetadata(tail.getSerializedTail(), 0, metadataSize,
+            InStream.options().withCodec(codec).withBufferSize(bufferSize));
       } finally {
         OrcCodecPool.returnCodec(compressionKind, codec);
       }
@@ -775,10 +736,6 @@ public class ReaderImpl implements Reader {
       result.add(new StripeStatistics(ss.getColStatsList()));
     }
     return result;
-  }
-
-  public List<OrcProto.UserMetadataItem> getOrcProtoUserMetadata() {
-    return userMetadata;
   }
 
   @Override

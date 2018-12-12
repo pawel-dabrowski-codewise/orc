@@ -21,12 +21,57 @@
 
 #include "orc/Vector.hh"
 #include "orc/Type.hh"
-#include "Exceptions.hh"
-#include "wrap/orc-proto-wrapper.hh"
+#include "orc/Exceptions.hh"
 
 #include <string>
 
 namespace orc {
+
+  class FileVersion {
+  private:
+    uint32_t majorVersion;
+    uint32_t minorVersion;
+  public:
+    static const FileVersion& v_0_11();
+    static const FileVersion& v_0_12();
+
+    FileVersion(uint32_t major, uint32_t minor) :
+                majorVersion(major), minorVersion(minor) {
+    }
+
+    /**
+     * Get major version
+     */
+    uint32_t getMajor() const {
+        return this->majorVersion;
+    }
+
+    /**
+     * Get minor version
+     */
+    uint32_t getMinor() const {
+        return this->minorVersion;
+    }
+
+    bool operator == (const FileVersion & right) const {
+      return this->majorVersion == right.getMajor() &&
+              this->minorVersion == right.getMinor();
+    }
+
+    bool operator != (const FileVersion & right) const {
+      return !(*this == right);
+    }
+
+    std::string toString() const;
+  };
+
+  enum WriterId {
+    ORC_JAVA_WRITER = 0,
+    ORC_CPP_WRITER = 1,
+    PRESTO_WRITER = 2,
+    UNKNOWN_WRITER = INT32_MAX
+  };
+
   enum CompressionKind {
     CompressionKind_NONE = 0,
     CompressionKind_ZLIB = 1,
@@ -34,7 +79,7 @@ namespace orc {
     CompressionKind_LZO = 3,
     CompressionKind_LZ4 = 4,
     CompressionKind_ZSTD = 5,
-    CompressionKind_MAX = INT64_MAX
+    CompressionKind_MAX = INT32_MAX
   };
 
   /**
@@ -50,7 +95,7 @@ namespace orc {
     WriterVersion_HIVE_13083 = 4,
     WriterVersion_ORC_101 = 5,
     WriterVersion_ORC_135 = 6,
-    WriterVersion_MAX = INT64_MAX
+    WriterVersion_MAX = INT32_MAX
   };
 
   /**

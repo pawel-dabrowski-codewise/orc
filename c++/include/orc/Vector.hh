@@ -134,7 +134,7 @@ namespace orc {
 
     /**
      * The offset of the first element of each list.
-     * The length of list i is startOffset[i+1] - startOffset[i].
+     * The length of list i is offsets[i+1] - offsets[i].
      */
     DataBuffer<int64_t> offsets;
 
@@ -151,8 +151,8 @@ namespace orc {
     bool hasVariableLength();
 
     /**
-     * The offset of the first element of each list.
-     * The length of list i is startOffset[i+1] - startOffset[i].
+     * The offset of the first element of each map.
+     * The size of map i is offsets[i+1] - offsets[i].
      */
     DataBuffer<int64_t> offsets;
 
@@ -216,6 +216,7 @@ namespace orc {
      */
     DataBuffer<int64_t> readScales;
     friend class Decimal64ColumnReader;
+    friend class Decimal64ColumnWriter;
   };
 
   struct Decimal128VectorBatch: public ColumnVectorBatch {
@@ -241,6 +242,7 @@ namespace orc {
     DataBuffer<int64_t> readScales;
     friend class Decimal128ColumnReader;
     friend class DecimalHive11ColumnReader;
+    friend class Decimal128ColumnWriter;
   };
 
   /**
@@ -256,6 +258,9 @@ namespace orc {
     uint64_t getMemoryUsage();
 
     // the number of seconds past 1 Jan 1970 00:00 UTC (aka time_t)
+    // Note that we always assume data is in GMT timezone; therefore it is
+    // user's responsibility to convert wall clock time in local timezone
+    // to GMT.
     DataBuffer<int64_t> data;
 
     // the nanoseconds of each value

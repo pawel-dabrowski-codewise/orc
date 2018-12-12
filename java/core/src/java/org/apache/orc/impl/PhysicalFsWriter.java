@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 import com.google.protobuf.CodedOutputStream;
+
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -35,6 +36,7 @@ import org.apache.orc.CompressionKind;
 import org.apache.orc.OrcFile;
 import org.apache.orc.OrcProto;
 import org.apache.orc.PhysicalWriter;
+import org.apache.orc.impl.writer.StreamOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,28 +46,32 @@ public class PhysicalFsWriter implements PhysicalWriter {
 
   private static final int HDFS_BUFFER_SIZE = 256 * 1024;
 
-  private final FSDataOutputStream rawWriter;
+  private FSDataOutputStream rawWriter;
   // the compressed metadata information outStream
-  private OutStream writer = null;
+  private OutStream writer;
   // a protobuf outStream around streamFactory
-  private CodedOutputStream protobufWriter = null;
+  private CodedOutputStream protobufWriter;
 
   private final Path path;
+  private final HadoopShims shims;
   private final long blockSize;
   private final int bufferSize;
-  private final double paddingTolerance;
-  private final long defaultStripeSize;
+  private final int maxPadding;
   private final CompressionKind compress;
-  private final CompressionCodec codec;
+  private final OrcFile.CompressionStrategy compressionStrategy;
+  private CompressionCodec codec;
   private final boolean addBlockPadding;
+  private final boolean writeVariableLengthBlocks;
 
   // the streams that make up the current stripe
   private final Map<StreamName, BufferedStream> streams =
     new TreeMap<>();
 
-  private long adjustedStripeSize;
   private long headerLength;
   private long stripeStart;
+  // The position of the last time we wrote a short block, which becomes the
+  // natural blocks
+  private long blockOffset;
   private int metadataLength;
   private int footerLength;
 
@@ -73,7 +79,7 @@ public class PhysicalFsWriter implements PhysicalWriter {
                           Path path,
                           OrcFile.WriterOptions opts) throws IOException {
     this.path = path;
-    this.defaultStripeSize = this.adjustedStripeSize = opts.getStripeSize();
+    long defaultStripeSize = opts.getStripeSize();
     this.addBlockPadding = opts.getBlockPadding();
     if (opts.isEnforceBufferSize()) {
       this.bufferSize = opts.getBufferSize();
@@ -83,17 +89,25 @@ public class PhysicalFsWriter implements PhysicalWriter {
           opts.getBufferSize());
     }
     this.compress = opts.getCompress();
-    this.paddingTolerance = opts.getPaddingTolerance();
+    this.compressionStrategy = opts.getCompressionStrategy();
+    this.maxPadding = (int) (opts.getPaddingTolerance() * defaultStripeSize);
     this.blockSize = opts.getBlockSize();
     LOG.info("ORC writer created for path: {} with stripeSize: {} blockSize: {}" +
         " compression: {} bufferSize: {}", path, defaultStripeSize, blockSize,
         compress, bufferSize);
-    rawWriter = fs.create(path, false, HDFS_BUFFER_SIZE,
+    rawWriter = fs.create(path, opts.getOverwrite(), HDFS_BUFFER_SIZE,
         fs.getDefaultReplication(path), blockSize);
+    blockOffset = 0;
     codec = OrcCodecPool.getCodec(compress);
-    writer = new OutStream("metadata", bufferSize, codec,
+    StreamOptions options = new StreamOptions(bufferSize);
+    if (codec != null) {
+      options.withCodec(codec, codec.createOptions());
+    }
+    writer = new OutStream("metadata", options,
         new DirectStream(rawWriter));
     protobufWriter = CodedOutputStream.newInstance(writer);
+    writeVariableLengthBlocks = opts.getWriteVariableLengthBlocks();
+    shims = opts.getHadoopShims();
   }
 
   @Override
@@ -101,51 +115,67 @@ public class PhysicalFsWriter implements PhysicalWriter {
     return codec;
   }
 
-  private void padStripe(long indexSize, long dataSize, int footerSize) throws IOException {
-    this.stripeStart = rawWriter.getPos();
-    final long currentStripeSize = indexSize + dataSize + footerSize;
-    final long available = blockSize - (stripeStart % blockSize);
-    final long overflow = currentStripeSize - adjustedStripeSize;
-    final float availRatio = (float) available / (float) defaultStripeSize;
+  /**
+   * Get the number of bytes for a file in a given column
+   * by finding all the streams (not suppressed)
+   * for a given column and returning the sum of their sizes.
+   * excludes index
+   *
+   * @param column column from which to get file size
+   * @return number of bytes for the given column
+   */
+  @Override
+  public long getFileBytes(final int column) {
+    long size = 0;
+    for (final Map.Entry<StreamName, BufferedStream> pair: streams.entrySet()) {
+      final BufferedStream receiver = pair.getValue();
+      if(!receiver.isSuppressed) {
 
-    if (availRatio > 0.0f && availRatio < 1.0f
-        && availRatio > paddingTolerance) {
-      // adjust default stripe size to fit into remaining space, also adjust
-      // the next stripe for correction based on the current stripe size
-      // and user specified padding tolerance. Since stripe size can overflow
-      // the default stripe size we should apply this correction to avoid
-      // writing portion of last stripe to next hdfs block.
-      double correction = overflow > 0 ? (double) overflow
-          / (double) adjustedStripeSize : 0.0;
-
-      // correction should not be greater than user specified padding
-      // tolerance
-      correction = correction > paddingTolerance ? paddingTolerance
-          : correction;
-
-      // adjust next stripe size based on current stripe estimate correction
-      adjustedStripeSize = (long) ((1.0f - correction) * (availRatio * defaultStripeSize));
-    } else if (availRatio >= 1.0) {
-      adjustedStripeSize = defaultStripeSize;
-    }
-
-    if (availRatio < paddingTolerance && addBlockPadding) {
-      long padding = blockSize - (stripeStart % blockSize);
-      byte[] pad = new byte[(int) Math.min(HDFS_BUFFER_SIZE, padding)];
-      LOG.info(String.format("Padding ORC by %d bytes (<=  %.2f * %d)",
-          padding, availRatio, defaultStripeSize));
-      stripeStart += padding;
-      while (padding > 0) {
-        int writeLen = (int) Math.min(padding, pad.length);
-        rawWriter.write(pad, 0, writeLen);
-        padding -= writeLen;
+        final StreamName name = pair.getKey();
+        if(name.getColumn() == column && name.getArea() != StreamName.Area.INDEX ) {
+          size += receiver.getOutputSize();
+        }
       }
-      adjustedStripeSize = defaultStripeSize;
-    } else if (currentStripeSize < blockSize
-        && (stripeStart % blockSize) + currentStripeSize > blockSize) {
-      // even if you don't pad, reset the default stripe size when crossing a
-      // block boundary
-      adjustedStripeSize = defaultStripeSize;
+
+    }
+    return size;
+  }
+
+  private static final byte[] ZEROS = new byte[64*1024];
+
+  private static void writeZeros(OutputStream output,
+                                 long remaining) throws IOException {
+    while (remaining > 0) {
+      long size = Math.min(ZEROS.length, remaining);
+      output.write(ZEROS, 0, (int) size);
+      remaining -= size;
+    }
+  }
+
+  /**
+   * Do any required shortening of the HDFS block or padding to avoid stradling
+   * HDFS blocks. This is called before writing the current stripe.
+   * @param stripeSize the number of bytes in the current stripe
+   */
+  private void padStripe(long stripeSize) throws IOException {
+    this.stripeStart = rawWriter.getPos();
+    long previousBytesInBlock = (stripeStart - blockOffset) % blockSize;
+    // We only have options if this isn't the first stripe in the block
+    if (previousBytesInBlock > 0) {
+      if (previousBytesInBlock + stripeSize >= blockSize) {
+        // Try making a short block
+        if (writeVariableLengthBlocks &&
+            shims.endVariableLengthBlock(rawWriter)) {
+          blockOffset = stripeStart;
+        } else if (addBlockPadding) {
+          // if we cross the block boundary, figure out what we should do
+          long padding = blockSize - previousBytesInBlock;
+          if (padding <= maxPadding) {
+            writeZeros(rawWriter, padding);
+            stripeStart += padding;
+          }
+        }
+      }
     }
   }
 
@@ -224,8 +254,14 @@ public class PhysicalFsWriter implements PhysicalWriter {
 
   @Override
   public void close() throws IOException {
+    // We don't use the codec directly but do give it out codec in getCompressionCodec;
+    // that is used in tests, for boolean checks, and in StreamFactory. Some of the changes that
+    // would get rid of this pattern require cross-project interface changes, so just return the
+    // codec for now.
     OrcCodecPool.returnCodec(compress, codec);
+    codec = null;
     rawWriter.close();
+    rawWriter = null;
   }
 
   @Override
@@ -337,7 +373,7 @@ public class PhysicalFsWriter implements PhysicalWriter {
 
     OrcProto.StripeFooter footer = footerBuilder.build();
     // Do we need to pad the file so the stripe doesn't straddle a block boundary?
-    padStripe(indexSize, dataSize, footer.getSerializedSize());
+    padStripe(indexSize + dataSize + footer.getSerializedSize());
 
     // write out the data streams
     for (Map.Entry<StreamName, BufferedStream> pair : streams.entrySet()) {
@@ -363,22 +399,30 @@ public class PhysicalFsWriter implements PhysicalWriter {
     return result;
   }
 
+  StreamOptions getOptions(OrcProto.Stream.Kind kind) {
+    StreamOptions options = new StreamOptions(bufferSize);
+    if (codec != null) {
+      options.withCodec(codec, WriterImpl.getCustomizedCodec(codec,
+          compressionStrategy, kind));
+    }
+    return options;
+  }
+
   @Override
   public void writeIndex(StreamName name,
-                         OrcProto.RowIndex.Builder index,
-                         CompressionCodec codec) throws IOException {
-    OutputStream stream = new OutStream(path.toString(), bufferSize, codec,
-        createDataStream(name));
+                         OrcProto.RowIndex.Builder index) throws IOException {
+    OutputStream stream = new OutStream(path.toString(),
+        getOptions(name.getKind()), createDataStream(name));
     index.build().writeTo(stream);
     stream.flush();
   }
 
   @Override
   public void writeBloomFilter(StreamName name,
-                               OrcProto.BloomFilterIndex.Builder bloom,
-                               CompressionCodec codec) throws IOException {
-    OutputStream stream = new OutStream(path.toString(), bufferSize, codec,
-        createDataStream(name));
+                               OrcProto.BloomFilterIndex.Builder bloom
+                               ) throws IOException {
+    OutputStream stream = new OutStream(path.toString(),
+        getOptions(name.getKind()), createDataStream(name));
     bloom.build().writeTo(stream);
     stream.flush();
   }

@@ -22,7 +22,8 @@ orc.bloom.filter.fpp     | 0.05        | bloom filter false positive rate
 
 For example, to create an ORC table without high level compression:
 
-```CREATE TABLE istari (
+```
+CREATE TABLE istari (
   name STRING,
   color STRING
 ) STORED AS ORC TBLPROPERTIES ("orc.compress"="NONE");
@@ -108,7 +109,7 @@ There are many Hive configuration properties related to ORC files:
       available size within the block is more than 3.2Mb, a new
       smaller stripe will be inserted to fit within that space. This
       will make sure that no stripe written will cross block
-      boundaries and cause remote reads within a node local task.</t>
+      boundaries and cause remote reads within a node local task.</td>
 </tr>
 <tr>
   <td>hive.exec.orc.default.compress</td>
@@ -178,5 +179,12 @@ There are many Hive configuration properties related to ORC files:
   <td>Define the compression strategy to use while writing data. This changes
       the compression level of higher level compression codec. Value can be
       SPEED or COMPRESSION.</td>
+</tr>
+<tr>
+  <td>orc.write.variable.length.blocks</td>
+  <td>false</td>
+  <td>Should the ORC writer use HDFS variable length blocks, if they are
+      available? If the new stripe would straddle a block, Hadoop is &ge; 2.7,
+      and this is enabled, it will end the block before the new stripe.</td>
 </tr>
 </table>

@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,13 +17,15 @@
  */
 package org.apache.orc.impl;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-
 import org.apache.commons.lang.builder.HashCodeBuilder;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -35,7 +37,6 @@ import org.apache.orc.CompressionKind;
 import org.apache.orc.DataReader;
 import org.apache.orc.OrcFile;
 import org.apache.orc.OrcProto;
-
 import org.apache.orc.StripeInformation;
 import org.apache.orc.TypeDescription;
 
@@ -43,7 +44,8 @@ import org.apache.orc.TypeDescription;
  * Stateless methods shared between RecordReaderImpl and EncodedReaderImpl.
  */
 public class RecordReaderUtils {
-  private static final HadoopShims SHIMS = HadoopShims.Factory.get();
+  private static final HadoopShims SHIMS = HadoopShimsFactory.get();
+  private static final Logger LOG = LoggerFactory.getLogger(RecordReaderUtils.class);
 
   static boolean hadBadBloomFilters(TypeDescription.Category category,
                                     OrcFile.WriterVersion version) {
@@ -143,36 +145,34 @@ public class RecordReaderUtils {
 
   private static class DefaultDataReader implements DataReader {
     private FSDataInputStream file = null;
-    private final ByteBufferAllocatorPool pool;
+    private ByteBufferAllocatorPool pool;
     private HadoopShims.ZeroCopyReaderShim zcr = null;
     private final FileSystem fs;
     private final Path path;
     private final boolean useZeroCopy;
-    private final CompressionCodec codec;
-    private final int bufferSize;
+    private InStream.StreamOptions options = InStream.options();
     private final int typeCount;
     private CompressionKind compressionKind;
+    private final int maxDiskRangeChunkLimit;
 
     private DefaultDataReader(DataReaderProperties properties) {
       this.fs = properties.getFileSystem();
       this.path = properties.getPath();
       this.useZeroCopy = properties.getZeroCopy();
       this.compressionKind = properties.getCompression();
-      this.codec = OrcCodecPool.getCodec(compressionKind);
-      this.bufferSize = properties.getBufferSize();
+      options.withCodec(OrcCodecPool.getCodec(compressionKind))
+          .withBufferSize(properties.getBufferSize());
       this.typeCount = properties.getTypeCount();
-      if (useZeroCopy) {
-        this.pool = new ByteBufferAllocatorPool();
-      } else {
-        this.pool = null;
-      }
+      this.maxDiskRangeChunkLimit = properties.getMaxDiskRangeChunkLimit();
     }
 
     @Override
     public void open() throws IOException {
       this.file = fs.open(path);
       if (useZeroCopy) {
-        zcr = RecordReaderUtils.createZeroCopyShim(file, codec, pool);
+        // ZCR only uses codec for boolean checks.
+        pool = new ByteBufferAllocatorPool();
+        zcr = RecordReaderUtils.createZeroCopyShim(file, options.getCodec(), pool);
       } else {
         zcr = null;
       }
@@ -208,7 +208,7 @@ public class RecordReaderUtils {
       DiskRangeList ranges = planIndexReading(fileSchema, footer,
           ignoreNonUtf8BloomFilter, included, sargColumns, version,
           bloomFilterKinds);
-      ranges = readDiskRanges(file, zcr, stripe.getOffset(), ranges, false);
+      ranges = readDiskRanges(file, zcr, stripe.getOffset(), ranges, false, maxDiskRangeChunkLimit);
       long offset = 0;
       DiskRangeList range = ranges;
       for(OrcProto.Stream stream: footer.getStreamsList()) {
@@ -229,10 +229,9 @@ public class RecordReaderUtils {
                 bb.position((int) (offset - range.getOffset()));
                 bb.limit((int) (bb.position() + stream.getLength()));
                 indexes[column] = OrcProto.RowIndex.parseFrom(
-                    InStream.createCodedInputStream("index",
-                        ReaderImpl.singleton(new BufferChunk(bb, 0)),
-                        stream.getLength(),
-                    codec, bufferSize));
+                    InStream.createCodedInputStream(InStream.create("index",
+                        new BufferChunk(bb, 0),
+                        stream.getLength(), options)));
               }
               break;
             case BLOOM_FILTER:
@@ -242,9 +241,9 @@ public class RecordReaderUtils {
                 bb.position((int) (offset - range.getOffset()));
                 bb.limit((int) (bb.position() + stream.getLength()));
                 bloomFilterIndices[column] = OrcProto.BloomFilterIndex.parseFrom
-                    (InStream.createCodedInputStream("bloom_filter",
-                        ReaderImpl.singleton(new BufferChunk(bb, 0)),
-                    stream.getLength(), codec, bufferSize));
+                    (InStream.createCodedInputStream(InStream.create(
+                        "bloom_filter", new BufferChunk(bb, 0),
+                        stream.getLength(), options)));
               }
               break;
             default:
@@ -267,21 +266,22 @@ public class RecordReaderUtils {
       // read the footer
       ByteBuffer tailBuf = ByteBuffer.allocate(tailLength);
       file.readFully(offset, tailBuf.array(), tailBuf.arrayOffset(), tailLength);
-      return OrcProto.StripeFooter.parseFrom(InStream.createCodedInputStream("footer",
-          ReaderImpl.singleton(new BufferChunk(tailBuf, 0)),
-          tailLength, codec, bufferSize));
+      return OrcProto.StripeFooter.parseFrom(
+          InStream.createCodedInputStream(InStream.create("footer",
+              new BufferChunk(tailBuf, 0), tailLength, options)));
     }
 
     @Override
     public DiskRangeList readFileData(
         DiskRangeList range, long baseOffset, boolean doForceDirect) throws IOException {
-      return RecordReaderUtils.readDiskRanges(file, zcr, baseOffset, range, doForceDirect);
+      return RecordReaderUtils.readDiskRanges(file, zcr, baseOffset, range, doForceDirect, maxDiskRangeChunkLimit);
     }
 
     @Override
     public void close() throws IOException {
-      if (codec != null) {
-        OrcCodecPool.returnCodec(compressionKind, codec);
+      if (options.getCodec() != null) {
+        OrcCodecPool.returnCodec(compressionKind, options.getCodec());
+        options.withCodec(null);
       }
       if (pool != null) {
         pool.clear();
@@ -290,6 +290,7 @@ public class RecordReaderUtils {
       try (HadoopShims.ZeroCopyReaderShim myZcr = zcr) {
         if (file != null) {
           file.close();
+          file = null;
         }
       }
     }
@@ -306,8 +307,18 @@ public class RecordReaderUtils {
 
     @Override
     public DataReader clone() {
+      if (this.file != null) {
+        // We should really throw here, but that will cause failures in Hive.
+        // While Hive uses clone, just log a warning.
+        LOG.warn("Cloning an opened DataReader; the stream will be reused and closed twice");
+      }
       try {
-        return (DataReader) super.clone();
+        DefaultDataReader clone = (DefaultDataReader) super.clone();
+        if (options.getCodec() != null) {
+          // Make sure we don't share the same codec between two readers.
+          clone.options = options.clone();
+        }
+        return clone;
       } catch (CloneNotSupportedException e) {
         throw new UnsupportedOperationException("uncloneable", e);
       }
@@ -315,7 +326,7 @@ public class RecordReaderUtils {
 
     @Override
     public CompressionCodec getCompressionCodec() {
-      return codec;
+      return options.getCodec();
     }
   }
 
@@ -511,8 +522,9 @@ public class RecordReaderUtils {
                                       HadoopShims.ZeroCopyReaderShim zcr,
                                  long base,
                                  DiskRangeList range,
-                                 boolean doForceDirect) throws IOException {
-    if (range == null) return null;
+                                 boolean doForceDirect, int maxChunkLimit) throws IOException {
+    if (range == null)
+      return null;
     DiskRangeList prev = range.prev;
     if (prev == null) {
       prev = new DiskRangeList.MutateHelper(range);
@@ -522,39 +534,47 @@ public class RecordReaderUtils {
         range = range.next;
         continue;
       }
-      int len = (int) (range.getEnd() - range.getOffset());
+      boolean firstRead = true;
+      long len = range.getEnd() - range.getOffset();
       long off = range.getOffset();
-      if (zcr != null) {
-        file.seek(base + off);
-        boolean hasReplaced = false;
-        while (len > 0) {
-          ByteBuffer partial = zcr.readBuffer(len, false);
-          BufferChunk bc = new BufferChunk(partial, off);
-          if (!hasReplaced) {
-            range.replaceSelfWith(bc);
-            hasReplaced = true;
-          } else {
-            range.insertAfter(bc);
+      while (len > 0) {
+        // Stripe could be too large to read fully into a single buffer and
+        // will need to be chunked
+        int readSize = (len >= maxChunkLimit) ? maxChunkLimit : (int) len;
+        ByteBuffer partial;
+
+        // create chunk
+        if (zcr != null) {
+          if (firstRead) {
+            file.seek(base + off);
           }
-          range = bc;
-          int read = partial.remaining();
-          len -= read;
-          off += read;
-        }
-      } else {
-        // Don't use HDFS ByteBuffer API because it has no readFully, and is buggy and pointless.
-        byte[] buffer = new byte[len];
-        file.readFully((base + off), buffer, 0, buffer.length);
-        ByteBuffer bb = null;
-        if (doForceDirect) {
-          bb = ByteBuffer.allocateDirect(len);
-          bb.put(buffer);
-          bb.position(0);
-          bb.limit(len);
+
+          partial = zcr.readBuffer(readSize, false);
+          readSize = partial.remaining();
         } else {
-          bb = ByteBuffer.wrap(buffer);
+          // Don't use HDFS ByteBuffer API because it has no readFully, and is
+          // buggy and pointless.
+          byte[] buffer = new byte[readSize];
+          file.readFully((base + off), buffer, 0, buffer.length);
+          if (doForceDirect) {
+            partial = ByteBuffer.allocateDirect(readSize);
+            partial.put(buffer);
+            partial.position(0);
+            partial.limit(readSize);
+          } else {
+            partial = ByteBuffer.wrap(buffer);
+          }
         }
-        range = range.replaceSelfWith(new BufferChunk(bb, range.getOffset()));
+        BufferChunk bc = new BufferChunk(partial, off);
+        if (firstRead) {
+          range.replaceSelfWith(bc);
+        } else {
+          range.insertAfter(bc);
+        }
+        firstRead = false;
+        range = bc;
+        len -= readSize;
+        off += readSize;
       }
       range = range.next;
     }
@@ -562,42 +582,49 @@ public class RecordReaderUtils {
   }
 
 
-  static List<DiskRange> getStreamBuffers(DiskRangeList range, long offset, long length) {
+  static DiskRangeList getStreamBuffers(DiskRangeList range, long offset,
+                                        long length) {
     // This assumes sorted ranges (as do many other parts of ORC code.
-    ArrayList<DiskRange> buffers = new ArrayList<DiskRange>();
-    if (length == 0) return buffers;
-    long streamEnd = offset + length;
-    boolean inRange = false;
-    while (range != null) {
-      if (!inRange) {
-        if (range.getEnd() <= offset) {
-          range = range.next;
-          continue; // Skip until we are in range.
+    BufferChunkList result = new BufferChunkList();
+    if (length != 0) {
+      long streamEnd = offset + length;
+      boolean inRange = false;
+      while (range != null) {
+        if (!inRange) {
+          if (range.getEnd() <= offset) {
+            range = range.next;
+            continue; // Skip until we are in range.
+          }
+          inRange = true;
+          if (range.getOffset() < offset) {
+            // Partial first buffer, add a slice of it.
+            result.add((BufferChunk) range.sliceAndShift(offset,
+                Math.min(streamEnd, range.getEnd()), -offset));
+            if (range.getEnd() >= streamEnd)
+              break; // Partial first buffer is also partial last buffer.
+            range = range.next;
+            continue;
+          }
+        } else if (range.getOffset() >= streamEnd) {
+          break;
         }
-        inRange = true;
-        if (range.getOffset() < offset) {
-          // Partial first buffer, add a slice of it.
-          buffers.add(range.sliceAndShift(offset, Math.min(streamEnd, range.getEnd()), -offset));
-          if (range.getEnd() >= streamEnd) break; // Partial first buffer is also partial last buffer.
-          range = range.next;
-          continue;
+        if (range.getEnd() > streamEnd) {
+          // Partial last buffer (may also be the first buffer), add a slice of it.
+          result.add((BufferChunk) range.sliceAndShift(range.getOffset(),
+              streamEnd, -offset));
+          break;
         }
-      } else if (range.getOffset() >= streamEnd) {
-        break;
+        // Buffer that belongs entirely to one stream.
+        // TODO: ideally we would want to reuse the object and remove it from
+        //       the list, but we cannot because bufferChunks is also used by
+        //       clearStreams for zcr. Create a useless dup.
+        result.add((BufferChunk) range.sliceAndShift(range.getOffset(),
+            range.getEnd(), -offset));
+        if (range.getEnd() == streamEnd) break;
+        range = range.next;
       }
-      if (range.getEnd() > streamEnd) {
-        // Partial last buffer (may also be the first buffer), add a slice of it.
-        buffers.add(range.sliceAndShift(range.getOffset(), streamEnd, -offset));
-        break;
-      }
-      // Buffer that belongs entirely to one stream.
-      // TODO: ideally we would want to reuse the object and remove it from the list, but we cannot
-      //       because bufferChunks is also used by clearStreams for zcr. Create a useless dup.
-      buffers.add(range.sliceAndShift(range.getOffset(), range.getEnd(), -offset));
-      if (range.getEnd() == streamEnd) break;
-      range = range.next;
     }
-    return buffers;
+    return result.get();
   }
 
   static HadoopShims.ZeroCopyReaderShim createZeroCopyShim(FSDataInputStream file,

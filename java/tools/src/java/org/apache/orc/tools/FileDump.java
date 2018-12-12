@@ -18,6 +18,7 @@
 package org.apache.orc.tools;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
@@ -301,7 +302,7 @@ public final class FileDump {
     if (reader == null) {
       return;
     }
-
+    TypeDescription schema = reader.getSchema();
     System.out.println("Structure for " + filename);
     System.out.println("File Version: " + reader.getFileVersion().getName() +
         " with " + reader.getWriterVersion());
@@ -383,7 +384,8 @@ public final class FileDump {
             .readRowIndex(stripeIx, null, null, null, sargColumns);
         for (int col : rowIndexCols) {
           StringBuilder buf = new StringBuilder();
-          String rowIdxString = getFormattedRowIndices(col, indices.getRowGroupIndex());
+          String rowIdxString = getFormattedRowIndices(col,
+              indices.getRowGroupIndex(), schema);
           buf.append(rowIdxString);
           String bloomFilString = getFormattedBloomFilters(col, indices,
               reader.getWriterVersion(),
@@ -404,9 +406,15 @@ public final class FileDump {
     System.out.println("\nFile length: " + fileLen + " bytes");
     System.out.println("Padding length: " + paddedBytes + " bytes");
     System.out.println("Padding ratio: " + format.format(percentPadding) + "%");
-    AcidStats acidStats = OrcAcidUtils.parseAcidStats(reader);
-    if (acidStats != null) {
-      System.out.println("ACID stats:" + acidStats);
+    //print out any user metadata properties
+    List<String> keys = reader.getMetadataKeys();
+    for(int i = 0; i < keys.size(); i++) {
+      if(i == 0) {
+        System.out.println("\nUser Metadata:");
+      }
+      ByteBuffer byteBuffer = reader.getMetadataValue(keys.get(i));
+      System.out.println("  " + keys.get(i) + "="
+        + StandardCharsets.UTF_8.decode(byteBuffer));
     }
     rows.close();
   }
@@ -655,7 +663,8 @@ public final class FileDump {
   }
 
   private static String getFormattedRowIndices(int col,
-                                               OrcProto.RowIndex[] rowGroupIndex) {
+                                               OrcProto.RowIndex[] rowGroupIndex,
+                                               TypeDescription schema) {
     StringBuilder buf = new StringBuilder();
     OrcProto.RowIndex index;
     buf.append("    Row group indices for column ").append(col).append(":");
@@ -665,6 +674,7 @@ public final class FileDump {
       return buf.toString();
     }
 
+    TypeDescription colSchema = schema.findSubtype(col);
     for (int entryIx = 0; entryIx < index.getEntryCount(); ++entryIx) {
       buf.append("\n      Entry ").append(entryIx).append(": ");
       OrcProto.RowIndexEntry entry = index.getEntry(entryIx);
@@ -676,7 +686,8 @@ public final class FileDump {
       if (colStats == null) {
         buf.append("no stats at ");
       } else {
-        ColumnStatistics cs = ColumnStatisticsImpl.deserialize(colStats);
+        ColumnStatistics cs =
+            ColumnStatisticsImpl.deserialize(colSchema, colStats);
         buf.append(cs.toString());
       }
       buf.append(" positions: ");

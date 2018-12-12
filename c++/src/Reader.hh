@@ -24,7 +24,7 @@
 #include "orc/Reader.hh"
 
 #include "ColumnReader.hh"
-#include "Exceptions.hh"
+#include "orc/Exceptions.hh"
 #include "RLE.hh"
 #include "TypeImpl.hh"
 
@@ -178,7 +178,7 @@ namespace orc {
     std::shared_ptr<FileContents> contents;
 
     // inputs
-    const ReaderOptions& options;
+    const ReaderOptions options;
     const uint64_t fileLength;
     const uint64_t postscriptLength;
 
@@ -190,7 +190,7 @@ namespace orc {
     // internal methods
     void readMetadata() const;
     void checkOrcVersion();
-    void getRowIndexStatistics(uint64_t stripeOffset,
+    void getRowIndexStatistics(const proto::StripeInformation& stripeInfo, uint64_t stripeIndex,
                                const proto::StripeFooter& currentStripeFooter,
                                std::vector<std::vector<proto::ColumnStatistics> >* indexStats) const;
 
@@ -214,7 +214,11 @@ namespace orc {
 
     CompressionKind getCompression() const override;
 
-    std::string getFormatVersion() const override;
+    FileVersion getFormatVersion() const override;
+
+    WriterId getWriterId() const override;
+
+    uint32_t getWriterIdValue() const override;
 
     WriterVersion getWriterVersion() const override;
 

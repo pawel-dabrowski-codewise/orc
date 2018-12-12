@@ -82,6 +82,7 @@ namespace orc {
     EXPECT_TRUE(other->hasNull());
     EXPECT_EQ(9999, other->getMaximum());
     EXPECT_EQ(-9999, other->getMinimum());
+    EXPECT_TRUE(other->hasSum());
     EXPECT_EQ(100000, other->getSum());
 
     intStats->merge(*other);
@@ -173,26 +174,9 @@ namespace orc {
     EXPECT_TRUE(std::abs(971341.3203 - dblStats->getSum()) < 0.00001);
   }
 
-  TEST(ColumnStatistics, stringColumnStatisticsWithNoStringComparison) {
+  TEST(ColumnStatistics, stringColumnStatistics) {
     std::unique_ptr<StringColumnStatisticsImpl> strStats(
-      new StringColumnStatisticsImpl(false));
-
-    EXPECT_FALSE(strStats->hasMinimum());
-    EXPECT_FALSE(strStats->hasMaximum());
-    EXPECT_EQ(0, strStats->getNumberOfValues());
-    EXPECT_TRUE(strStats->hasTotalLength());
-    EXPECT_EQ(0, strStats->getTotalLength());
-
-    strStats->update("string");
-    EXPECT_FALSE(strStats->hasMinimum());
-    EXPECT_FALSE(strStats->hasMaximum());
-    EXPECT_TRUE(strStats->hasTotalLength());
-    EXPECT_EQ(6, strStats->getTotalLength());
-  }
-
-  TEST(ColumnStatistics, stringColumnStatisticsWithStringComparison) {
-    std::unique_ptr<StringColumnStatisticsImpl> strStats(
-      new StringColumnStatisticsImpl(true));
+      new StringColumnStatisticsImpl());
 
     EXPECT_FALSE(strStats->hasMinimum());
     EXPECT_FALSE(strStats->hasMaximum());

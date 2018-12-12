@@ -19,7 +19,6 @@
 package org.apache.orc.tools;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assume.assumeTrue;
 
 import java.io.BufferedReader;
@@ -28,8 +27,9 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.PrintStream;
-import java.sql.Date;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -39,7 +39,6 @@ import java.util.Random;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hive.common.type.HiveDecimal;
 import org.apache.hadoop.hive.ql.exec.vector.BytesColumnVector;
 import org.apache.hadoop.hive.ql.exec.vector.DecimalColumnVector;
 import org.apache.hadoop.hive.ql.exec.vector.DoubleColumnVector;
@@ -237,6 +236,10 @@ public class TestFileDump {
     if (batch.size > 0) {
       writer.addRowBatch(batch);
     }
+    writer.addUserMetadata("hive.acid.key.index",
+      StandardCharsets.UTF_8.encode("1,1,1;2,3,5;"));
+    writer.addUserMetadata("some.user.property",
+      StandardCharsets.UTF_8.encode("foo#bar$baz&"));
     writer.close();
     assertEquals(2079000, writer.getRawDataSize());
     assertEquals(21000, writer.getNumberOfRows());
@@ -257,6 +260,7 @@ public class TestFileDump {
   @Test
   public void testDataDump() throws Exception {
     TypeDescription schema = getAllTypesType();
+    SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
     Writer writer = OrcFile.createWriter(testFilePath,
         OrcFile.writerOptions(conf)
             .fileSystem(fs)
@@ -277,14 +281,16 @@ public class TestFileDump {
         4.0f,
         20.0,
         new HiveDecimalWritable("4.2222"),
-        new Timestamp(1416967764000L),
-        new DateWritable(new Date(1416967764000L)),
+        new Timestamp(format.parse("2014-11-25 18:09:24").getTime()),
+        new DateWritable(DateWritable.millisToDays(
+            format.parse("2014-11-25 00:00:00").getTime())),
         "string",
         "hello",
        "hello",
         m,
         Arrays.asList(100, 200),
         10, "foo");
+
     m.clear();
     m.put("k3", "v3");
     appendAllTypes(
@@ -297,8 +303,9 @@ public class TestFileDump {
         8.0f,
         40.0,
         new HiveDecimalWritable("2.2222"),
-        new Timestamp(1416967364000L),
-        new DateWritable(new Date(1411967764000L)),
+        new Timestamp(format.parse("2014-11-25 18:02:44").getTime()),
+        new DateWritable(DateWritable.millisToDays(
+            format.parse("2014-09-28 00:00:00").getTime())),
         "abcd",
         "world",
         "world",

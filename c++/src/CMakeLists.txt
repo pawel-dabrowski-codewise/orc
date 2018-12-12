@@ -26,6 +26,15 @@ CHECK_CXX_SOURCE_COMPILES("
 )
 
 CHECK_CXX_SOURCE_COMPILES("
+    #include<time.h>
+    int main(int,char*[]){
+      struct tm time2020;
+      return !strptime(\"2020-02-02 12:34:56\", \"%Y-%m-%d %H:%M:%S\", &time2020);
+    }"
+  HAS_STRPTIME
+)
+
+CHECK_CXX_SOURCE_COMPILES("
     #include<string>
     int main(int,char* argv[]){
       return static_cast<int>(std::stoll(argv[0]));
@@ -51,6 +60,10 @@ CHECK_CXX_SOURCE_COMPILES("
       #pragma GCC diagnostic push
       #pragma GCC diagnostic ignored \"-Wdeprecated\"
       #pragma GCC diagnostic pop
+   #elif defined(_MSC_VER)
+      #pragma warning( push )
+      #pragma warning( disable : 4996 )
+      #pragma warning( pop )
    #else
      unknownCompiler!
    #endif
@@ -85,13 +98,33 @@ CHECK_CXX_SOURCE_COMPILES("
   NEEDS_REDUNDANT_MOVE
 )
 
+CHECK_CXX_SOURCE_COMPILES("
+    #include<string>
+    int main(int, char *[]) {
+      double d = 5;
+      std::to_string(d);
+    }"
+  HAS_DOUBLE_TO_STRING
+)
+
+CHECK_CXX_SOURCE_COMPILES("
+    #include<cstdint>
+    #include<string>
+    int main(int, char *[]) {
+      int64_t d = 5;
+      std::to_string(d);
+    }"
+  HAS_INT64_TO_STRING
+)
+
 INCLUDE(CheckCXXSourceRuns)
 
 CHECK_CXX_SOURCE_RUNS("
     #include<time.h>
     int main(int, char *[]) {
-      time_t t = -1000;
-      return gmtime(&t) == 0;
+      time_t t = -14210715; // 1969-07-20 12:34:45
+      struct tm *ptm = gmtime(&t);
+      return !(ptm && ptm->tm_year == 69);
     }"
   HAS_PRE_1970
 )
@@ -111,6 +144,18 @@ CHECK_CXX_SOURCE_RUNS("
   HAS_POST_2038
 )
 
+set(CMAKE_REQUIRED_INCLUDES ${ZLIB_INCLUDE_DIR})
+set(CMAKE_REQUIRED_LIBRARIES zlib)
+CHECK_CXX_SOURCE_COMPILES("
+    #define Z_PREFIX
+    #include<zlib.h>
+    z_stream strm;
+    int main(int, char *[]) {
+        deflateReset(&strm);
+    }"
+  NEEDS_Z_PREFIX
+)
+
 configure_file (
   "Adaptor.hh.in"
   "${CMAKE_CURRENT_BINARY_DIR}/Adaptor.hh"
@@ -119,10 +164,12 @@ configure_file (
 include_directories (
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
-  ${PROTOBUF_INCLUDE_DIRS}
-  ${ZLIB_INCLUDE_DIRS}
-  ${SNAPPY_INCLUDE_DIRS}
-  ${LZ4_INCLUDE_DIRS}
+  ${PROTOBUF_INCLUDE_DIR}
+  ${ZLIB_INCLUDE_DIR}
+  ${SNAPPY_INCLUDE_DIR}
+  ${LZ4_INCLUDE_DIR}
+  ${LIBHDFSPP_INCLUDE_DIR}
+  ${ZSTD_INCLUDE_DIR}
   )
 
 add_custom_command(OUTPUT orc_proto.pb.h orc_proto.pb.cc
@@ -132,15 +179,17 @@ add_custom_command(OUTPUT orc_proto.pb.h orc_proto.pb.cc
         "${CMAKE_SOURCE_DIR}/proto/orc_proto.proto"
 )
 
-add_library (orc STATIC
+set(SOURCE_FILES
   "${CMAKE_CURRENT_BINARY_DIR}/Adaptor.hh"
   orc_proto.pb.h
   io/InputStream.cc
   io/OutputStream.cc
   wrap/orc-proto-wrapper.cc
+  Adaptor.cc
   ByteRLE.cc
   ColumnPrinter.cc
   ColumnReader.cc
+  ColumnWriter.cc
   Common.cc
   Compression.cc
   Exceptions.cc
@@ -150,22 +199,31 @@ add_library (orc STATIC
   OrcFile.cc
   Reader.cc
   RLEv1.cc
-  RLEv2.cc
+  RLEV2Util.cc
+  RleDecoderV2.cc
+  RleEncoderV2.cc
   RLE.cc
   Statistics.cc
   StripeStream.cc
   Timezone.cc
   TypeImpl.cc
   Vector.cc
+  Writer.cc)
+
+if(BUILD_LIBHDFSPP)
+  set(SOURCE_FILES ${SOURCE_FILES} OrcHdfsFile.cc)
+  add_definitions(-DBUILD_LIBHDFSPP)
+endif(BUILD_LIBHDFSPP)
+
+add_library (orc STATIC ${SOURCE_FILES})
+
+target_link_libraries (orc
+  protobuf
+  zlib
+  snappy
+  lz4
+  zstd
+  ${LIBHDFSPP_LIBRARIES}
   )
 
 install(TARGETS orc DESTINATION lib)
-
-target_link_libraries (orc
-  ${PROTOBUF_LIBRARIES}
-  ${ZLIB_LIBRARIES}
-  ${SNAPPY_LIBRARIES}
-  ${LZ4_LIBRARIES}
-  )
-
-add_dependencies(orc protobuf)

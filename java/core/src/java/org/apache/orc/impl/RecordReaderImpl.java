@@ -99,26 +99,22 @@ public class RecordReaderImpl implements RecordReader {
   private final DataReader dataReader;
   private final boolean ignoreNonUtf8BloomFilter;
   private final OrcFile.WriterVersion writerVersion;
+  private final int maxDiskRangeChunkLimit;
 
   /**
    * Given a list of column names, find the given column and return the index.
    *
    * @param evolution the mapping from reader to file schema
-   * @param columnName  the column name to look for
+   * @param columnName  the fully qualified column name to look for
    * @return the file column number or -1 if the column wasn't found
    */
   static int findColumns(SchemaEvolution evolution,
                          String columnName) {
-    TypeDescription readerSchema = evolution.getReaderBaseSchema();
-    List<String> fieldNames = readerSchema.getFieldNames();
-    List<TypeDescription> children = readerSchema.getChildren();
-    for (int i = 0; i < fieldNames.size(); ++i) {
-      if (columnName.equals(fieldNames.get(i))) {
-        TypeDescription result = evolution.getFileType(children.get(i));
-        return result == null ? -1 : result.getId();
-      }
+    try {
+      return evolution.getFileSchema().findSubtype(columnName).getId();
+    } catch (IllegalArgumentException e) {
+      return -1;
     }
-    return -1;
   }
 
   /**
@@ -128,8 +124,9 @@ public class RecordReaderImpl implements RecordReader {
    * @return an array mapping the sarg leaves to concrete column numbers in the
    * file
    */
-  public static int[] mapSargColumnsToOrcInternalColIdx(List<PredicateLeaf> sargLeaves,
-                             SchemaEvolution evolution) {
+  public static int[] mapSargColumnsToOrcInternalColIdx(
+                            List<PredicateLeaf> sargLeaves,
+                            SchemaEvolution evolution) {
     int[] result = new int[sargLeaves.size()];
     Arrays.fill(result, -1);
     for(int i=0; i < result.length; ++i) {
@@ -214,12 +211,14 @@ public class RecordReaderImpl implements RecordReader {
     SearchArgument sarg = options.getSearchArgument();
     if (sarg != null && rowIndexStride != 0) {
       sargApp = new SargApplier(sarg,
-                                rowIndexStride,
-                                evolution,
-                                writerVersion);
+          rowIndexStride,
+          evolution,
+          writerVersion,
+          fileReader.useUTCTimestamp);
     } else {
       sargApp = null;
     }
+
     long rows = 0;
     long skippedRows = 0;
     long offset = options.getOffset();
@@ -233,7 +232,7 @@ public class RecordReaderImpl implements RecordReader {
         rows += stripe.getNumberOfRows();
       }
     }
-
+    this.maxDiskRangeChunkLimit = OrcConf.ORC_MAX_DISK_RANGE_CHUNK_LIMIT.getInt(fileReader.conf);
     Boolean zeroCopy = options.getUseZeroCopy();
     if (zeroCopy == null) {
       zeroCopy = OrcConf.USE_ZEROCOPY.getBoolean(fileReader.conf);
@@ -249,9 +248,9 @@ public class RecordReaderImpl implements RecordReader {
               .withPath(fileReader.path)
               .withTypeCount(types.size())
               .withZeroCopy(zeroCopy)
+              .withMaxDiskRangeChunkLimit(maxDiskRangeChunkLimit)
               .build());
     }
-    this.dataReader.open();
     firstRow = skippedRows;
     totalRowCount = rows;
     Boolean skipCorrupt = options.getSkipCorruptRecords();
@@ -259,16 +258,27 @@ public class RecordReaderImpl implements RecordReader {
       skipCorrupt = OrcConf.SKIP_CORRUPT_DATA.getBoolean(fileReader.conf);
     }
 
-    TreeReaderFactory.ReaderContext readerContext = new TreeReaderFactory.ReaderContext()
-      .setSchemaEvolution(evolution)
-      .skipCorrupt(skipCorrupt);
-    reader = TreeReaderFactory.createTreeReader(evolution.getReaderSchema(), readerContext);
+    TreeReaderFactory.ReaderContext readerContext =
+        new TreeReaderFactory.ReaderContext()
+          .setSchemaEvolution(evolution)
+          .skipCorrupt(skipCorrupt)
+          .fileFormat(fileReader.getFileVersion())
+          .useUTCTimestamp(fileReader.useUTCTimestamp);
+    reader = TreeReaderFactory.createTreeReader(evolution.getReaderSchema(),
+        readerContext);
 
     this.fileIncluded = evolution.getFileIncluded();
     indexes = new OrcProto.RowIndex[types.size()];
     bloomFilterIndices = new OrcProto.BloomFilterIndex[types.size()];
     bloomFilterKind = new OrcProto.Stream.Kind[types.size()];
-    advanceToNextRow(reader, 0L, true);
+
+    try {
+      advanceToNextRow(reader, 0L, true);
+    } catch (IOException e) {
+      // Try to close since this happens in constructor.
+      close();
+      throw e;
+    }
   }
 
   public static final class PositionProviderImpl implements PositionProvider {
@@ -331,6 +341,19 @@ public class RecordReaderImpl implements RecordReader {
    * @return the object for the maximum value or null if there isn't one
    */
   static Object getMax(ColumnStatistics index) {
+    return getMax(index, false);
+  }
+
+  /**
+   * Get the maximum value out of an index entry.
+   * Includes option to specify if timestamp column stats values
+   * should be in UTC.
+   * @param index
+   *          the index entry
+   * @param useUTCTimestamp
+   * @return the object for the maximum value or null if there isn't one
+   */
+  static Object getMax(ColumnStatistics index, boolean useUTCTimestamp) {
     if (index instanceof IntegerColumnStatistics) {
       return ((IntegerColumnStatistics) index).getMaximum();
     } else if (index instanceof DoubleColumnStatistics) {
@@ -342,7 +365,11 @@ public class RecordReaderImpl implements RecordReader {
     } else if (index instanceof DecimalColumnStatistics) {
       return ((DecimalColumnStatistics) index).getMaximum();
     } else if (index instanceof TimestampColumnStatistics) {
-      return ((TimestampColumnStatistics) index).getMaximum();
+      if (useUTCTimestamp) {
+        return ((TimestampColumnStatistics) index).getMaximumUTC();
+      } else {
+        return ((TimestampColumnStatistics) index).getMaximum();
+      }
     } else if (index instanceof BooleanColumnStatistics) {
       if (((BooleanColumnStatistics)index).getTrueCount()!=0) {
         return Boolean.TRUE;
@@ -361,6 +388,19 @@ public class RecordReaderImpl implements RecordReader {
    * @return the object for the minimum value or null if there isn't one
    */
   static Object getMin(ColumnStatistics index) {
+    return getMin(index, false);
+  }
+
+  /**
+   * Get the minimum value out of an index entry.
+   * Includes option to specify if timestamp column stats values
+   * should be in UTC.
+   * @param index
+   *          the index entry
+   * @param useUTCTimestamp
+   * @return the object for the minimum value or null if there isn't one
+   */
+  static Object getMin(ColumnStatistics index, boolean useUTCTimestamp) {
     if (index instanceof IntegerColumnStatistics) {
       return ((IntegerColumnStatistics) index).getMinimum();
     } else if (index instanceof DoubleColumnStatistics) {
@@ -372,7 +412,11 @@ public class RecordReaderImpl implements RecordReader {
     } else if (index instanceof DecimalColumnStatistics) {
       return ((DecimalColumnStatistics) index).getMinimum();
     } else if (index instanceof TimestampColumnStatistics) {
-      return ((TimestampColumnStatistics) index).getMinimum();
+      if (useUTCTimestamp) {
+        return ((TimestampColumnStatistics) index).getMinimumUTC();
+      } else {
+        return ((TimestampColumnStatistics) index).getMinimum();
+      }
     } else if (index instanceof BooleanColumnStatistics) {
       if (((BooleanColumnStatistics)index).getFalseCount()!=0) {
         return Boolean.FALSE;
@@ -402,9 +446,35 @@ public class RecordReaderImpl implements RecordReader {
                                            OrcProto.BloomFilter bloomFilter,
                                            OrcFile.WriterVersion writerVersion,
                                            TypeDescription.Category type) {
-    ColumnStatistics cs = ColumnStatisticsImpl.deserialize(statsProto);
-    Object minValue = getMin(cs);
-    Object maxValue = getMax(cs);
+    return evaluatePredicateProto(statsProto, predicate, kind, encoding, bloomFilter,
+        writerVersion, type, false);
+  }
+
+  /**
+   * Evaluate a predicate with respect to the statistics from the column
+   * that is referenced in the predicate.
+   * Includes option to specify if timestamp column stats values
+   * should be in UTC.
+   * @param statsProto the statistics for the column mentioned in the predicate
+   * @param predicate the leaf predicate we need to evaluation
+   * @param bloomFilter the bloom filter
+   * @param writerVersion the version of software that wrote the file
+   * @param type what is the kind of this column
+   * @param useUTCTimestamp
+   * @return the set of truth values that may be returned for the given
+   *   predicate.
+   */
+  static TruthValue evaluatePredicateProto(OrcProto.ColumnStatistics statsProto,
+                                           PredicateLeaf predicate,
+                                           OrcProto.Stream.Kind kind,
+                                           OrcProto.ColumnEncoding encoding,
+                                           OrcProto.BloomFilter bloomFilter,
+                                           OrcFile.WriterVersion writerVersion,
+                                           TypeDescription.Category type,
+                                           boolean useUTCTimestamp) {
+    ColumnStatistics cs = ColumnStatisticsImpl.deserialize(null, statsProto);
+    Object minValue = getMin(cs, useUTCTimestamp);
+    Object maxValue = getMax(cs, useUTCTimestamp);
     // files written before ORC-135 stores timestamp wrt to local timezone causing issues with PPD.
     // disable PPD for timestamp for all old files
     if (type.equals(TypeDescription.Category.TIMESTAMP)) {
@@ -421,7 +491,8 @@ public class RecordReaderImpl implements RecordReader {
       }
     }
     return evaluatePredicateRange(predicate, minValue, maxValue, cs.hasNull(),
-        BloomFilterIO.deserialize(kind, encoding, writerVersion, type, bloomFilter));
+        BloomFilterIO.deserialize(kind, encoding, writerVersion, type, bloomFilter),
+        useUTCTimestamp);
   }
 
   /**
@@ -435,13 +506,32 @@ public class RecordReaderImpl implements RecordReader {
   public static TruthValue evaluatePredicate(ColumnStatistics stats,
                                              PredicateLeaf predicate,
                                              BloomFilter bloomFilter) {
-    Object minValue = getMin(stats);
-    Object maxValue = getMax(stats);
-    return evaluatePredicateRange(predicate, minValue, maxValue, stats.hasNull(), bloomFilter);
+    return evaluatePredicate(stats, predicate, bloomFilter, false);
+  }
+
+  /**
+   * Evaluate a predicate with respect to the statistics from the column
+   * that is referenced in the predicate.
+   * Includes option to specify if timestamp column stats values
+   * should be in UTC.
+   * @param stats the statistics for the column mentioned in the predicate
+   * @param predicate the leaf predicate we need to evaluation
+   * @param bloomFilter
+   * @param useUTCTimestamp
+   * @return the set of truth values that may be returned for the given
+   *   predicate.
+   */
+  public static TruthValue evaluatePredicate(ColumnStatistics stats,
+                                             PredicateLeaf predicate,
+                                             BloomFilter bloomFilter,
+                                             boolean useUTCTimestamp) {
+    Object minValue = getMin(stats, useUTCTimestamp);
+    Object maxValue = getMax(stats, useUTCTimestamp);
+    return evaluatePredicateRange(predicate, minValue, maxValue, stats.hasNull(), bloomFilter, useUTCTimestamp);
   }
 
   static TruthValue evaluatePredicateRange(PredicateLeaf predicate, Object min,
-      Object max, boolean hasNull, BloomFilter bloomFilter) {
+      Object max, boolean hasNull, BloomFilter bloomFilter, boolean useUTCTimestamp) {
     // if we didn't have any values, everything must have been null
     if (min == null) {
       if (predicate.getOperator() == PredicateLeaf.Operator.IS_NULL) {
@@ -462,7 +552,7 @@ public class RecordReaderImpl implements RecordReader {
 
     result = evaluatePredicateMinMax(predicate, predObj, minValue, maxValue, hasNull);
     if (shouldEvaluateBloomFilter(predicate, result, bloomFilter)) {
-      return evaluatePredicateBloomFilter(predicate, predObj, bloomFilter, hasNull);
+      return evaluatePredicateBloomFilter(predicate, predObj, bloomFilter, hasNull, useUTCTimestamp);
     } else {
       return result;
     }
@@ -581,18 +671,18 @@ public class RecordReaderImpl implements RecordReader {
   }
 
   private static TruthValue evaluatePredicateBloomFilter(PredicateLeaf predicate,
-      final Object predObj, BloomFilter bloomFilter, boolean hasNull) {
+      final Object predObj, BloomFilter bloomFilter, boolean hasNull, boolean useUTCTimestamp) {
     switch (predicate.getOperator()) {
       case NULL_SAFE_EQUALS:
         // null safe equals does not return *_NULL variant. So set hasNull to false
-        return checkInBloomFilter(bloomFilter, predObj, false);
+        return checkInBloomFilter(bloomFilter, predObj, false, useUTCTimestamp);
       case EQUALS:
-        return checkInBloomFilter(bloomFilter, predObj, hasNull);
+        return checkInBloomFilter(bloomFilter, predObj, hasNull, useUTCTimestamp);
       case IN:
         for (Object arg : predicate.getLiteralList()) {
           // if atleast one value in IN list exist in bloom filter, qualify the row group/stripe
           Object predObjItem = getBaseObjectForComparison(predicate.getType(), arg);
-          TruthValue result = checkInBloomFilter(bloomFilter, predObjItem, hasNull);
+          TruthValue result = checkInBloomFilter(bloomFilter, predObjItem, hasNull, useUTCTimestamp);
           if (result == TruthValue.YES_NO_NULL || result == TruthValue.YES_NO) {
             return result;
           }
@@ -603,7 +693,7 @@ public class RecordReaderImpl implements RecordReader {
     }
   }
 
-  private static TruthValue checkInBloomFilter(BloomFilter bf, Object predObj, boolean hasNull) {
+  private static TruthValue checkInBloomFilter(BloomFilter bf, Object predObj, boolean hasNull, boolean useUTCTimestamp) {
     TruthValue result = hasNull ? TruthValue.NO_NULL : TruthValue.NO;
 
     if (predObj instanceof Long) {
@@ -621,8 +711,14 @@ public class RecordReaderImpl implements RecordReader {
         result = TruthValue.YES_NO_NULL;
       }
     } else if (predObj instanceof Timestamp) {
-      if (bf.testLong(SerializationUtils.convertToUtc(TimeZone.getDefault(), ((Timestamp) predObj).getTime()))) {
-        result = TruthValue.YES_NO_NULL;
+      if (useUTCTimestamp) {
+        if (bf.testLong(((Timestamp) predObj).getTime())) {
+          result = TruthValue.YES_NO_NULL;
+        }
+      } else {
+        if (bf.testLong(SerializationUtils.convertToUtc(TimeZone.getDefault(), ((Timestamp) predObj).getTime()))) {
+          result = TruthValue.YES_NO_NULL;
+        }
       }
     } else if (predObj instanceof Date) {
       if (bf.testLong(DateWritable.dateToDays((Date) predObj))) {
@@ -774,11 +870,13 @@ public class RecordReaderImpl implements RecordReader {
     private final boolean[] sargColumns;
     private SchemaEvolution evolution;
     private final long[] exceptionCount;
+    private final boolean useUTCTimestamp;
 
     public SargApplier(SearchArgument sarg,
                        long rowIndexStride,
                        SchemaEvolution evolution,
-                       OrcFile.WriterVersion writerVersion) {
+                       OrcFile.WriterVersion writerVersion,
+                       boolean useUTCTimestamp) {
       this.writerVersion = writerVersion;
       this.sarg = sarg;
       sargLeaves = sarg.getLeaves();
@@ -797,6 +895,7 @@ public class RecordReaderImpl implements RecordReader {
       }
       this.evolution = evolution;
       exceptionCount = new long[sargLeaves.size()];
+      this.useUTCTimestamp = useUTCTimestamp;
     }
 
     /**
@@ -848,7 +947,8 @@ public class RecordReaderImpl implements RecordReader {
                 leafValues[pred] = evaluatePredicateProto(stats,
                     predicate, bfk, encodings.get(columnIx), bf,
                     writerVersion, evolution.getFileSchema().
-                        findSubtype(columnIx).getCategory());
+                    findSubtype(columnIx).getCategory(),
+                    useUTCTimestamp);
               } catch (Exception e) {
                 exceptionCount[pred] += 1;
                 if (e instanceof SargCastException) {
@@ -1068,6 +1168,8 @@ public class RecordReaderImpl implements RecordReader {
       int bufferSize,
       Map<StreamName, InStream> streams) throws IOException {
     long streamOffset = 0;
+    InStream.StreamOptions options = InStream.options().withCodec(codec)
+        .withBufferSize(bufferSize);
     for (OrcProto.Stream streamDesc : streamDescriptions) {
       int column = streamDesc.getColumn();
       if ((includeColumn != null &&
@@ -1077,11 +1179,11 @@ public class RecordReaderImpl implements RecordReader {
         streamOffset += streamDesc.getLength();
         continue;
       }
-      List<DiskRange> buffers = RecordReaderUtils.getStreamBuffers(
+      DiskRangeList buffers = RecordReaderUtils.getStreamBuffers(
           ranges, streamOffset, streamDesc.getLength());
       StreamName name = new StreamName(column, streamDesc.getKind());
       streams.put(name, InStream.create(name.toString(), buffers,
-          streamDesc.getLength(), codec, bufferSize));
+          streamDesc.getLength(), options));
       streamOffset += streamDesc.getLength();
     }
   }
@@ -1355,5 +1457,9 @@ public class RecordReaderImpl implements RecordReader {
 
   public CompressionCodec getCompressionCodec() {
     return dataReader.getCompressionCodec();
+  }
+
+  public int getMaxDiskRangeChunkLimit() {
+    return maxDiskRangeChunkLimit;
   }
 }

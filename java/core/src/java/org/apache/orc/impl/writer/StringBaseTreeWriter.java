@@ -76,11 +76,15 @@ public abstract class StringBaseTreeWriter extends TreeWriterBase {
     rowIndexValueCount.add(0L);
     buildIndex = writer.buildIndex();
     Configuration conf = writer.getConfiguration();
-    dictionaryKeySizeThreshold =
-        OrcConf.DICTIONARY_KEY_SIZE_THRESHOLD.getDouble(conf);
+    dictionaryKeySizeThreshold = writer.getDictionaryKeySizeThreshold(columnId);
     strideDictionaryCheck =
         OrcConf.ROW_INDEX_STRIDE_DICTIONARY_CHECK.getBoolean(conf);
-    doneDictionaryCheck = false;
+    if (dictionaryKeySizeThreshold <= 0.0) {
+      useDictionaryEncoding = false;
+      doneDictionaryCheck = true;
+    } else {
+      doneDictionaryCheck = false;
+    }
   }
 
   private void checkDictionaryEncoding() {
@@ -98,33 +102,16 @@ public abstract class StringBaseTreeWriter extends TreeWriterBase {
   public void writeStripe(OrcProto.StripeFooter.Builder builder,
                           OrcProto.StripeStatistics.Builder stats,
                           int requiredIndexEntries) throws IOException {
-    // if rows in stripe is less than dictionaryCheckAfterRows, dictionary
-    // checking would not have happened. So do it again here.
+
     checkDictionaryEncoding();
-
-    if (useDictionaryEncoding) {
-      flushDictionary();
-    } else {
-      // flushout any left over entries from dictionary
-      if (rows.size() > 0) {
-        flushDictionary();
-      }
-
-      // suppress the stream for every stripe if dictionary is disabled
+    if (!useDictionaryEncoding) {
       stringOutput.suppress();
     }
 
     // we need to build the rowindex before calling super, since it
     // writes it out.
     super.writeStripe(builder, stats, requiredIndexEntries);
-    if (useDictionaryEncoding) {
-      stringOutput.flush();
-      lengthOutput.flush();
-      rowOutput.flush();
-    } else {
-      directStreamOutput.flush();
-      lengthOutput.flush();
-    }
+
     // reset all of the fields to be ready for the next stripe.
     dictionary.clear();
     savedRowIndex.clear();
@@ -285,4 +272,32 @@ public abstract class StringBaseTreeWriter extends TreeWriterBase {
       return numVals * JavaDataModel.get().lengthForStringOfLength(avgSize);
     }
   }
+
+  @Override
+  public void flushStreams() throws IOException {
+    super.flushStreams();
+    // if rows in stripe is less than dictionaryCheckAfterRows, dictionary
+    // checking would not have happened. So do it again here.
+    checkDictionaryEncoding();
+
+    if (useDictionaryEncoding) {
+      flushDictionary();
+      stringOutput.flush();
+      lengthOutput.flush();
+      rowOutput.flush();
+    } else {
+      // flushout any left over entries from dictionary
+      if (rows.size() > 0) {
+        flushDictionary();
+      }
+
+      // suppress the stream for every stripe if dictionary is disabled
+      stringOutput.suppress();
+
+      directStreamOutput.flush();
+      lengthOutput.flush();
+    }
+
+  }
+
 }

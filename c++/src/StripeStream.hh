@@ -37,19 +37,22 @@ namespace orc {
   class StripeStreamsImpl: public StripeStreams {
   private:
     const RowReaderImpl& reader;
+    const proto::StripeInformation& stripeInfo;
     const proto::StripeFooter& footer;
+    const uint64_t stripeIndex;
     const uint64_t stripeStart;
     InputStream& input;
     const Timezone& writerTimezone;
 
   public:
-    StripeStreamsImpl(const RowReaderImpl& reader,
+    StripeStreamsImpl(const RowReaderImpl& reader, uint64_t index,
+                      const proto::StripeInformation& stripeInfo,
                       const proto::StripeFooter& footer,
                       uint64_t stripeStart,
                       InputStream& input,
                       const Timezone& writerTimezone);
 
-    virtual ~StripeStreamsImpl();
+    virtual ~StripeStreamsImpl() override;
 
     virtual const std::vector<bool> getSelectedColumns() const override;
 
@@ -92,7 +95,7 @@ namespace orc {
       // PASS
     }
 
-    ~StreamInformationImpl();
+    ~StreamInformationImpl() override;
 
     StreamKind getKind() const override {
       return kind;
@@ -150,7 +153,7 @@ namespace orc {
       // PASS
     }
 
-    virtual ~StripeInformationImpl() {
+    virtual ~StripeInformationImpl() override {
       // PASS
     }
 

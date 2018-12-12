@@ -18,6 +18,9 @@
 
 package org.apache.orc.impl.writer;
 
+import java.io.IOException;
+import java.util.List;
+
 import org.apache.hadoop.hive.ql.exec.vector.ColumnVector;
 import org.apache.hadoop.hive.ql.exec.vector.VectorizedRowBatch;
 import org.apache.orc.OrcFile;
@@ -35,9 +38,6 @@ import org.apache.orc.impl.StreamName;
 import org.apache.orc.util.BloomFilter;
 import org.apache.orc.util.BloomFilterIO;
 import org.apache.orc.util.BloomFilterUtf8;
-
-import java.io.IOException;
-import java.util.List;
 
 /**
  * The parent class of all of the writers for each column. Each column
@@ -64,6 +64,7 @@ public abstract class TreeWriterBase implements TreeWriter {
   private boolean foundNulls;
   private OutStream isPresentOutStream;
   private final WriterContext streamFactory;
+  private final TypeDescription schema;
 
   /**
    * Create a tree writer.
@@ -76,6 +77,7 @@ public abstract class TreeWriterBase implements TreeWriter {
                  TypeDescription schema,
                  WriterContext streamFactory,
                  boolean nullable) throws IOException {
+    this.schema = schema;
     this.streamFactory = streamFactory;
     this.isCompressed = streamFactory.isCompressed();
     this.id = columnId;
@@ -229,22 +231,33 @@ public abstract class TreeWriterBase implements TreeWriter {
     }
   }
 
-  public void writeStripe(OrcProto.StripeFooter.Builder builder,
-                          OrcProto.StripeStatistics.Builder stats,
-                          int requiredIndexEntries) throws IOException {
+  @Override
+  public void flushStreams() throws IOException {
+
     if (isPresent != null) {
       isPresent.flush();
-
-      // if no nulls are found in a stream, then suppress the stream
-      if(!foundNulls) {
-        isPresentOutStream.suppress();
-        // since isPresent bitstream is suppressed, update the index to
-        // remove the positions of the isPresent stream
-        if (rowIndex != null) {
-          removeIsPresentPositions();
-        }
-      }
     }
+
+  }
+
+  @Override
+  public void writeStripe(OrcProto.StripeFooter.Builder builder,
+      OrcProto.StripeStatistics.Builder stats, int requiredIndexEntries) throws IOException {
+
+    // if no nulls are found in a stream, then suppress the stream
+    if (isPresent != null && !foundNulls) {
+      isPresentOutStream.suppress();
+      // since isPresent bitstream is suppressed, update the index to
+      // remove the positions of the isPresent stream
+      if (rowIndex != null) {
+        removeIsPresentPositions();
+      }
+
+    }
+
+    /* Update byte count */
+    final long byteCount = streamFactory.getPhysicalWriter().getFileBytes(id);
+    stripeColStatistics.updateByteCount(byteCount);
 
     // merge stripe-level column statistics to file statistics and write it to
     // stripe statistics
@@ -259,8 +272,8 @@ public abstract class TreeWriterBase implements TreeWriter {
     if (rowIndex != null) {
       if (rowIndex.getEntryCount() != requiredIndexEntries) {
         throw new IllegalArgumentException("Column has wrong number of " +
-             "index entries found: " + rowIndex.getEntryCount() + " expected: " +
-             requiredIndexEntries);
+            "index entries found: " + rowIndex.getEntryCount() + " expected: " +
+            requiredIndexEntries);
       }
       streamFactory.writeIndex(new StreamName(id, OrcProto.Stream.Kind.ROW_INDEX), rowIndex);
       rowIndex.clear();
@@ -279,6 +292,7 @@ public abstract class TreeWriterBase implements TreeWriter {
           OrcProto.Stream.Kind.BLOOM_FILTER_UTF8), bloomFilterIndexUtf8);
       bloomFilterIndexUtf8.clear();
     }
+
   }
 
   /**
@@ -328,7 +342,8 @@ public abstract class TreeWriterBase implements TreeWriter {
 
   @Override
   public void updateFileStatistics(OrcProto.StripeStatistics stats) {
-    fileStatistics.merge(ColumnStatisticsImpl.deserialize(stats.getColStats(id)));
+    fileStatistics.merge(ColumnStatisticsImpl.deserialize(schema,
+        stats.getColStats(id)));
   }
 
   /**

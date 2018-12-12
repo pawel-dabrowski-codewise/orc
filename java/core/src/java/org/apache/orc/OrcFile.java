@@ -30,10 +30,14 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.orc.impl.HadoopShims;
+import org.apache.orc.impl.HadoopShimsFactory;
 import org.apache.orc.impl.MemoryManagerImpl;
 import org.apache.orc.impl.OrcTail;
 import org.apache.orc.impl.ReaderImpl;
 import org.apache.orc.impl.WriterImpl;
+import org.apache.orc.impl.WriterInternal;
+import org.apache.orc.impl.writer.WriterImplV2;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,6 +66,20 @@ public class OrcFile {
   public enum Version {
     V_0_11("0.11", 0, 11),
     V_0_12("0.12", 0, 12),
+
+    /**
+     * Do not use this format except for testing. It will not be compatible
+     * with other versions of the software. While we iterate on the ORC 2.0
+     * format, we will make incompatible format changes under this version
+     * without providing any forward or backward compatibility.
+     *
+     * When 2.0 is released, this version identifier will be completely removed.
+     */
+    UNSTABLE_PRE_2_0("UNSTABLE-PRE-2.0", 1, 9999),
+
+    /**
+     * The generic identifier for all unknown versions.
+     */
     FUTURE("future", Integer.MAX_VALUE, Integer.MAX_VALUE);
 
     public static final Version CURRENT = V_0_12;
@@ -111,6 +129,7 @@ public class OrcFile {
     ORC_JAVA(0), // ORC Java writer
     ORC_CPP(1),  // ORC C++ writer
     PRESTO(2),   // Presto writer
+    SCRITCHLEY_GO(3), // Go writer from https://github.com/scritchley/orc
     UNKNOWN(Integer.MAX_VALUE);
 
     private final int id;
@@ -152,12 +171,16 @@ public class OrcFile {
     HIVE_13083(WriterImplementation.ORC_JAVA, 4), // decimals write present stream correctly
     ORC_101(WriterImplementation.ORC_JAVA, 5),   // bloom filters use utf8
     ORC_135(WriterImplementation.ORC_JAVA, 6),   // timestamp stats use utc
+    ORC_203(WriterImplementation.ORC_JAVA, 7),   // trim long strings & record they were trimmed
 
     // C++ ORC Writer
     ORC_CPP_ORIGINAL(WriterImplementation.ORC_CPP, 6),
 
     // Presto Writer
     PRESTO_ORIGINAL(WriterImplementation.PRESTO, 6),
+
+    // Scritchley Go Writer
+    SCRITCHLEY_GO_ORIGINAL(WriterImplementation.SCRITCHLEY_GO, 6),
 
     // Don't use any magic numbers here except for the below:
     FUTURE(WriterImplementation.UNKNOWN, Integer.MAX_VALUE); // a version from a future writer
@@ -232,7 +255,7 @@ public class OrcFile {
   /**
    * The WriterVersion for this version of the software.
    */
-  public static final WriterVersion CURRENT_WRITER = WriterVersion.ORC_135;
+  public static final WriterVersion CURRENT_WRITER = WriterVersion.ORC_203;
 
   public enum EncodingStrategy {
     SPEED, COMPRESSION
@@ -254,6 +277,7 @@ public class OrcFile {
     // and remove this class altogether. Both footer caching and llap caching just needs OrcTail.
     // For now keeping this around to avoid complex surgery
     private FileMetadata fileMetadata;
+    private boolean useUTCTimestamp;
 
     public ReaderOptions(Configuration conf) {
       this.conf = conf;
@@ -298,6 +322,16 @@ public class OrcFile {
     public FileMetadata getFileMetadata() {
       return fileMetadata;
     }
+
+    public ReaderOptions useUTCTimestamp(boolean value) {
+      useUTCTimestamp = value;
+      return this;
+    }
+
+    public boolean getUseUTCTimestamp() {
+      return useUTCTimestamp;
+    }
+
   }
 
   public static ReaderOptions readerOptions(Configuration conf) {
@@ -370,10 +404,16 @@ public class OrcFile {
     private BloomFilterVersion bloomFilterVersion;
     private PhysicalWriter physicalWriter;
     private WriterVersion writerVersion = CURRENT_WRITER;
+    private boolean useUTCTimestamp;
+    private boolean overwrite;
+    private boolean writeVariableLengthBlocks;
+    private HadoopShims shims;
+    private String directEncodingColumns;
 
     protected WriterOptions(Properties tableProperties, Configuration conf) {
       configuration = conf;
       memoryManagerValue = getStaticMemoryManager(conf);
+      overwrite = OrcConf.OVERWRITE_OUTPUT_FILE.getBoolean(tableProperties, conf);
       stripeSizeValue = OrcConf.STRIPE_SIZE.getLong(tableProperties, conf);
       blockSizeValue = OrcConf.BLOCK_SIZE.getLong(tableProperties, conf);
       rowIndexStrideValue =
@@ -385,6 +425,7 @@ public class OrcFile {
       compressValue =
           CompressionKind.valueOf(OrcConf.COMPRESS.getString(tableProperties,
               conf).toUpperCase());
+      enforceBufferSize = OrcConf.ENFORCE_COMPRESSION_BUFFER_SIZE.getBoolean(tableProperties, conf);
       String versionName = OrcConf.WRITE_FORMAT.getString(tableProperties,
           conf);
       versionValue = Version.byName(versionName);
@@ -407,6 +448,11 @@ public class OrcFile {
           BloomFilterVersion.fromString(
               OrcConf.BLOOM_FILTER_WRITE_VERSION.getString(tableProperties,
                   conf));
+      shims = HadoopShimsFactory.get();
+      writeVariableLengthBlocks =
+          OrcConf.WRITE_VARIABLE_LENGTH_BLOCKS.getBoolean(tableProperties,conf);
+      directEncodingColumns = OrcConf.DIRECT_ENCODING_COLUMNS.getString(
+          tableProperties, conf);
     }
 
     /**
@@ -427,6 +473,15 @@ public class OrcFile {
      */
     public WriterOptions fileSystem(FileSystem value) {
       fileSystemValue = value;
+      return this;
+    }
+
+    /**
+     * If the output file already exists, should it be overwritten?
+     * If it is not provided, write operation will fail if the file already exists.
+     */
+    public WriterOptions overwrite(boolean value) {
+      overwrite = value;
       return this;
     }
 
@@ -592,6 +647,28 @@ public class OrcFile {
     }
 
     /**
+     * Should the ORC file writer use HDFS variable length blocks, if they
+     * are available?
+     * @param value the new value
+     * @return this
+     */
+    public WriterOptions writeVariableLengthBlocks(boolean value) {
+      writeVariableLengthBlocks = value;
+      return this;
+    }
+
+    /**
+     * Set the HadoopShims to use.
+     * This is only for testing.
+     * @param value the new value
+     * @return this
+     */
+    public WriterOptions setShims(HadoopShims value) {
+      this.shims = value;
+      return this;
+    }
+
+    /**
      * Manually set the writer version.
      * This is an internal API.
      * @param version the version to write
@@ -605,6 +682,25 @@ public class OrcFile {
       return this;
     }
 
+    /**
+     * Manually set the time zone for the writer to utc.
+     * If not defined, system time zone is assumed.
+     */
+    public WriterOptions useUTCTimestamp(boolean value) {
+      useUTCTimestamp = value;
+      return this;
+    }
+
+    /**
+     * Set the comma-separated list of columns that should be direct encoded.
+     * @param value the value to set
+     * @return this
+     */
+    public WriterOptions directEncodingColumns(String value) {
+      directEncodingColumns = value;
+      return this;
+    }
+
     public boolean getBlockPadding() {
       return blockPaddingValue;
     }
@@ -615,6 +711,10 @@ public class OrcFile {
 
     public String getBloomFilterColumns() {
       return bloomFilterColumns;
+    }
+
+    public boolean getOverwrite() {
+      return overwrite;
     }
 
     public FileSystem getFileSystem() {
@@ -688,6 +788,22 @@ public class OrcFile {
     public WriterVersion getWriterVersion() {
       return writerVersion;
     }
+
+    public boolean getWriteVariableLengthBlocks() {
+      return writeVariableLengthBlocks;
+    }
+
+    public HadoopShims getHadoopShims() {
+      return shims;
+    }
+
+    public boolean getUseUTCTimestamp() {
+      return useUTCTimestamp;
+    }
+
+    public String getDirectEncodingColumns() {
+      return directEncodingColumns;
+    }
   }
 
   /**
@@ -739,8 +855,16 @@ public class OrcFile {
                                     ) throws IOException {
     FileSystem fs = opts.getFileSystem() == null ?
         path.getFileSystem(opts.getConfiguration()) : opts.getFileSystem();
-
-    return new WriterImpl(fs, path, opts);
+    switch (opts.getVersion()) {
+      case V_0_11:
+      case V_0_12:
+        return new WriterImpl(fs, path, opts);
+      case UNSTABLE_PRE_2_0:
+        return new WriterImplV2(fs, path, opts);
+      default:
+        throw new IllegalArgumentException("Unknown version " +
+            opts.getVersion());
+    }
   }
 
   /**
@@ -875,7 +999,7 @@ public class OrcFile {
           rowIndexStride = reader.getRowIndexStride();
           fileVersion = reader.getFileVersion();
           writerVersion = reader.getWriterVersion();
-          options.blockSize(bufferSize)
+          options.bufferSize(bufferSize)
               .version(fileVersion)
               .writerVersion(writerVersion)
               .compress(compression)
@@ -893,7 +1017,7 @@ public class OrcFile {
           mergeMetadata(userMetadata, reader);
           if (bufferSize < reader.getCompressionSize()) {
             bufferSize = reader.getCompressionSize();
-            ((WriterImpl) output).increaseCompressionSize(bufferSize);
+            ((WriterInternal) output).increaseCompressionSize(bufferSize);
           }
         }
         List<OrcProto.StripeStatistics> statList =

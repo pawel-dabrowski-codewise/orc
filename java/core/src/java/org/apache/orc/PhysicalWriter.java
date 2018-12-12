@@ -68,8 +68,7 @@ public interface PhysicalWriter {
    * @param codec the compression codec to use
    */
   void writeIndex(StreamName name,
-                  OrcProto.RowIndex.Builder index,
-                  CompressionCodec codec) throws IOException;
+                  OrcProto.RowIndex.Builder index) throws IOException;
 
   /**
    * Write a bloom filter index in the given stream name.
@@ -78,8 +77,7 @@ public interface PhysicalWriter {
    * @param codec the compression codec to use
    */
   void writeBloomFilter(StreamName name,
-                        OrcProto.BloomFilterIndex.Builder bloom,
-                        CompressionCodec codec) throws IOException;
+                        OrcProto.BloomFilterIndex.Builder bloom) throws IOException;
 
   /**
    * Flushes the data in all the streams, spills them to disk, write out stripe
@@ -132,4 +130,11 @@ public interface PhysicalWriter {
 
   /** Gets a compression codec used by this writer. */
   CompressionCodec getCompressionCodec();
+
+  /**
+   * Get the number of bytes for a file in a givem column.
+   * @param column column from which to get file size
+   * @return number of bytes for the given column
+   */
+  long getFileBytes(int column);
 }

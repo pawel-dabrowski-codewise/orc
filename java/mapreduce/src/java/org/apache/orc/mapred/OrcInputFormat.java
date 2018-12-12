@@ -22,7 +22,9 @@ import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
 import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.lang.StringUtils;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
 import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentImpl;
 import org.apache.hadoop.io.WritableComparable;
@@ -30,8 +32,8 @@ import org.apache.hadoop.mapred.FileInputFormat;
 import org.apache.hadoop.mapred.FileSplit;
 import org.apache.hadoop.mapred.RecordReader;
 
-  
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.hadoop.io.NullWritable;
@@ -62,8 +64,13 @@ public class OrcInputFormat<V extends WritableComparable>
         schema.getCategory() != TypeDescription.Category.STRUCT) {
       return null;
     }
+
     boolean[] result = new boolean[schema.getMaximumId() + 1];
     result[0] = true;
+    if (StringUtils.isBlank(columnsStr)) {
+      return result;
+    }
+
     List<TypeDescription> types = schema.getChildren();
     for(String idString: columnsStr.split(",")) {
       TypeDescription type = types.get(Integer.parseInt(idString));
@@ -145,5 +152,27 @@ public class OrcInputFormat<V extends WritableComparable>
             .maxLength(OrcConf.MAX_FILE_LENGTH.getLong(conf)));
     return new OrcMapredRecordReader<>(file, buildOptions(conf,
         file, split.getStart(), split.getLength()));
+  }
+
+  /**
+   * Filter out the 0 byte files, so that we don't generate splits for the
+   * empty ORC files.
+   * @param job the job configuration
+   * @return a list of files that need to be read
+   * @throws IOException
+   */
+  protected FileStatus[] listStatus(JobConf job) throws IOException {
+    FileStatus[] result = super.listStatus(job);
+    List<FileStatus> ok = new ArrayList<>(result.length);
+    for(FileStatus stat: result) {
+      if (stat.getLen() != 0) {
+        ok.add(stat);
+      }
+    }
+    if (ok.size() == result.length) {
+      return result;
+    } else {
+      return ok.toArray(new FileStatus[ok.size()]);
+    }
   }
 }

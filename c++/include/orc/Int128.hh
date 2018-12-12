@@ -93,6 +93,12 @@ namespace orc {
       return *this;
     }
 
+    Int128 abs() const {
+      Int128 value = *this;
+      value.abs();
+      return value;
+    }
+
     Int128& invert() {
       lowbits = ~lowbits;
       highbits = ~highbits;
@@ -170,6 +176,17 @@ namespace orc {
       lowbits &= right.lowbits;
       highbits &= right.highbits;
       return *this;
+    }
+
+    /**
+     * Logical and between two Int128.
+     * @param right the number to and in
+     * @return logical and result
+     */
+    Int128 operator&(const Int128 &right) {
+      Int128 value = *this;
+      value &= right;
+      return value;
     }
 
     /**
@@ -268,9 +285,9 @@ namespace orc {
     bool fitsInLong() const {
       switch (highbits) {
       case 0:
-        return !(lowbits & LONG_SIGN_BIT);
+        return 0 == (lowbits & LONG_SIGN_BIT);
       case -1:
-        return lowbits & LONG_SIGN_BIT;
+        return 0 != (lowbits & LONG_SIGN_BIT);
       default:
         return false;
       }

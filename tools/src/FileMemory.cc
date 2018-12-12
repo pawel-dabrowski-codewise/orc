@@ -18,7 +18,7 @@
 
 #include "orc/orc-config.hh"
 #include "orc/ColumnPrinter.hh"
-#include "Exceptions.hh"
+#include "orc/Exceptions.hh"
 
 #include <string>
 #include <memory>
@@ -33,7 +33,7 @@ private:
   uint64_t maxMemory;
 
 public:
-  char* malloc(uint64_t size) override {
+  char* malloc(uint64_t size) ORC_OVERRIDE {
     char* p = static_cast<char*>(std::malloc(size));
     blocks[p] = size ;
     totalMemory += size;
@@ -43,7 +43,7 @@ public:
     return p;
   }
 
-  void free(char* p) override {
+  void free(char* p) ORC_OVERRIDE {
     std::free(p);
     totalMemory -= blocks[p] ;
     blocks.erase(p);
@@ -54,7 +54,7 @@ public:
   }
 
   TestMemoryPool(): totalMemory(0), maxMemory(0) {}
-  ~TestMemoryPool();
+  ~TestMemoryPool() ORC_OVERRIDE;
 };
 
 TestMemoryPool::~TestMemoryPool() {}
@@ -71,7 +71,7 @@ void processFile(const char* filename,
   readerOpts.setMemoryPool(*(pool.get()));
 
   std::unique_ptr<orc::Reader> reader =
-                  orc::createReader(orc::readLocalFile(std::string(filename)), readerOpts);
+                  orc::createReader(orc::readFile(std::string(filename)), readerOpts);
   std::unique_ptr<orc::RowReader> rowReader = reader->createRowReader(rowReaderOpts);
 
   std::unique_ptr<orc::ColumnVectorBatch> batch =

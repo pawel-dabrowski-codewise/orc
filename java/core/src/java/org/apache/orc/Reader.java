@@ -160,6 +160,9 @@ public interface Reader {
     private DataReader dataReader = null;
     private Boolean tolerateMissingSchema = null;
     private boolean forcePositionalEvolution;
+    private boolean isSchemaEvolutionCaseAware =
+        (boolean) OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.getDefaultValue();
+    private boolean includeAcidColumns = true;
 
     public Options() {
       // PASS
@@ -170,6 +173,8 @@ public interface Reader {
       skipCorruptRecords = OrcConf.SKIP_CORRUPT_DATA.getBoolean(conf);
       tolerateMissingSchema = OrcConf.TOLERATE_MISSING_SCHEMA.getBoolean(conf);
       forcePositionalEvolution = OrcConf.FORCE_POSITIONAL_EVOLUTION.getBoolean(conf);
+      isSchemaEvolutionCaseAware =
+          OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.getBoolean(conf);
     }
 
     /**
@@ -262,6 +267,24 @@ public interface Reader {
       return this;
     }
 
+    /**
+     * Set boolean flag to determine if the comparision of field names in schema
+     * evolution is case sensitive
+     * @param value the flag for schema evolution is case sensitive or not.
+     * @return
+     */
+    public Options isSchemaEvolutionCaseAware(boolean value) {
+      this.isSchemaEvolutionCaseAware = value;
+      return this;
+    }
+    /**
+     * {@code true} if acid metadata columns should be decoded otherwise they will
+     * be set to {@code null}.
+     */
+    public Options includeAcidColumns(boolean includeAcidColumns) {
+      this.includeAcidColumns = includeAcidColumns;
+      return this;
+    }
     public boolean[] getInclude() {
       return include;
     }
@@ -308,6 +331,14 @@ public interface Reader {
 
     public boolean getForcePositionalEvolution() {
       return forcePositionalEvolution;
+    }
+
+    public boolean getIsSchemaEvolutionCaseAware() {
+      return isSchemaEvolutionCaseAware;
+    }
+
+    public boolean getIncludeAcidColumns() {
+      return includeAcidColumns;
     }
 
     public Options clone() {
@@ -360,6 +391,7 @@ public interface Reader {
         buffer.append(", schema: ");
         schema.printToBuffer(buffer);
       }
+      buffer.append(", includeAcidColumns: ").append(includeAcidColumns);
       buffer.append("}");
       return buffer.toString();
     }

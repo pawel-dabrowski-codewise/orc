@@ -35,6 +35,7 @@ import org.apache.orc.ColumnStatistics;
 import org.apache.orc.CompressionCodec;
 import org.apache.orc.CompressionKind;
 import org.apache.orc.MemoryManager;
+import org.apache.orc.OrcConf;
 import org.apache.orc.OrcFile;
 import org.apache.orc.OrcProto;
 import org.apache.orc.OrcUtils;
@@ -42,6 +43,7 @@ import org.apache.orc.PhysicalWriter;
 import org.apache.orc.StripeInformation;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.Writer;
+import org.apache.orc.impl.writer.StreamOptions;
 import org.apache.orc.impl.writer.TreeWriter;
 import org.apache.orc.impl.writer.WriterContext;
 import org.slf4j.Logger;
@@ -72,7 +74,7 @@ import com.google.protobuf.ByteString;
  * to be confined to a single thread as well.
  *
  */
-public class WriterImpl implements Writer, MemoryManager.Callback {
+public class WriterImpl implements WriterInternal, MemoryManager.Callback {
 
   private static final Logger LOG = LoggerFactory.getLogger(WriterImpl.class);
 
@@ -112,6 +114,9 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
   private final double bloomFilterFpp;
   private final OrcFile.BloomFilterVersion bloomFilterVersion;
   private final boolean writeTimeZone;
+  private final boolean useUTCTimeZone;
+  private final double dictionaryKeySizeThreshold;
+  private final boolean[] directEncodingColumns;
 
   public WriterImpl(FileSystem fs,
                     Path path,
@@ -122,6 +127,10 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
     this.schema = opts.getSchema();
     this.writerVersion = opts.getWriterVersion();
     bloomFilterVersion = opts.getBloomFilterVersion();
+    this.directEncodingColumns = OrcUtils.includeColumns(
+        opts.getDirectEncodingColumns(), opts.getSchema());
+    dictionaryKeySizeThreshold =
+        OrcConf.DICTIONARY_KEY_SIZE_THRESHOLD.getDouble(conf);
     if (callback != null) {
       callbackContext = new OrcFile.WriterContext(){
 
@@ -133,7 +142,8 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
     } else {
       callbackContext = null;
     }
-    writeTimeZone = hasTimestamp(schema);
+    this.writeTimeZone = hasTimestamp(schema);
+    this.useUTCTimeZone = opts.getUseUTCTimestamp();
     this.adjustedStripeSize = opts.getStripeSize();
     this.version = opts.getVersion();
     this.encodingStrategy = opts.getEncodingStrategy();
@@ -144,10 +154,18 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
     buildIndex = rowIndexStride > 0;
     int numColumns = schema.getMaximumId() + 1;
     if (opts.isEnforceBufferSize()) {
+      OutStream.assertBufferSizeValid(opts.getBufferSize());
       this.bufferSize = opts.getBufferSize();
     } else {
       this.bufferSize = getEstimatedBufferSize(adjustedStripeSize,
           numColumns, opts.getBufferSize());
+    }
+    if (version == OrcFile.Version.FUTURE) {
+      throw new IllegalArgumentException("Can not write in a unknown version.");
+    } else if (version == OrcFile.Version.UNSTABLE_PRE_2_0) {
+      LOG.warn("ORC files written in " + version.getName() + " will not be" +
+          " readable by other versions of the software. It is only for" +
+          " developer testing.");
     }
     if (version == OrcFile.Version.V_0_11) {
       /* do not write bloom filters for ORC v11 */
@@ -185,12 +203,7 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
     return estBufferSize > bs ? bs : estBufferSize;
   }
 
-  /**
-   * Increase the buffer size for this writer.
-   * This function is internal only and should only be called by the
-   * ORC file merger.
-   * @param newSize the new buffer size.
-   */
+  @Override
   public void increaseCompressionSize(int newSize) {
     if (newSize > bufferSize) {
       bufferSize = newSize;
@@ -207,15 +220,15 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
     final int kb256 = 256 * 1024;
     if (estBufferSize <= kb4) {
       return kb4;
-    } else if (estBufferSize > kb4 && estBufferSize <= kb8) {
+    } else if (estBufferSize <= kb8) {
       return kb8;
-    } else if (estBufferSize > kb8 && estBufferSize <= kb16) {
+    } else if (estBufferSize <= kb16) {
       return kb16;
-    } else if (estBufferSize > kb16 && estBufferSize <= kb32) {
+    } else if (estBufferSize <= kb32) {
       return kb32;
-    } else if (estBufferSize > kb32 && estBufferSize <= kb64) {
+    } else if (estBufferSize <= kb64) {
       return kb64;
-    } else if (estBufferSize > kb64 && estBufferSize <= kb128) {
+    } else if (estBufferSize <= kb128) {
       return kb128;
     } else {
       return kb256;
@@ -231,10 +244,10 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
       case SNAPPY:
         return new SnappyCodec();
       case LZO:
-        return new AircompressorCodec(new LzoCompressor(),
+        return new AircompressorCodec(kind, new LzoCompressor(),
             new LzoDecompressor());
       case LZ4:
-        return new AircompressorCodec(new Lz4Compressor(),
+        return new AircompressorCodec(kind, new Lz4Compressor(),
             new Lz4Decompressor());
       default:
         throw new IllegalArgumentException("Unknown compression codec: " +
@@ -258,37 +271,35 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
   }
 
 
-  CompressionCodec getCustomizedCodec(OrcProto.Stream.Kind kind) {
-    // TODO: modify may create a new codec here. We want to end() it when the stream is closed,
-    //       but at this point there's no close() for the stream.
-    CompressionCodec result = physicalWriter.getCompressionCodec();
-    if (result != null) {
-      switch (kind) {
-        case BLOOM_FILTER:
-        case DATA:
-        case DICTIONARY_DATA:
-        case BLOOM_FILTER_UTF8:
-          if (compressionStrategy == OrcFile.CompressionStrategy.SPEED) {
-            result = result.modify(EnumSet.of(CompressionCodec.Modifier.FAST,
-                CompressionCodec.Modifier.TEXT));
-          } else {
-            result = result.modify(EnumSet.of(CompressionCodec.Modifier.DEFAULT,
-                CompressionCodec.Modifier.TEXT));
-          }
-          break;
-        case LENGTH:
-        case DICTIONARY_COUNT:
-        case PRESENT:
-        case ROW_INDEX:
-        case SECONDARY:
-          // easily compressed using the fastest modes
-          result = result.modify(EnumSet.of(CompressionCodec.Modifier.FASTEST,
-              CompressionCodec.Modifier.BINARY));
-          break;
-        default:
-          LOG.info("Missing ORC compression modifiers for " + kind);
-          break;
-      }
+  public static
+  CompressionCodec.Options getCustomizedCodec(CompressionCodec codec,
+                                              OrcFile.CompressionStrategy strategy,
+                                              OrcProto.Stream.Kind kind) {
+    CompressionCodec.Options result = codec.createOptions();
+    switch (kind) {
+      case BLOOM_FILTER:
+      case DATA:
+      case DICTIONARY_DATA:
+      case BLOOM_FILTER_UTF8:
+        result.setData(CompressionCodec.DataKind.TEXT);
+        if (strategy == OrcFile.CompressionStrategy.SPEED) {
+          result.setSpeed(CompressionCodec.SpeedModifier.FAST);
+        } else {
+          result.setSpeed(CompressionCodec.SpeedModifier.DEFAULT);
+        }
+        break;
+      case LENGTH:
+      case DICTIONARY_COUNT:
+      case PRESENT:
+      case ROW_INDEX:
+      case SECONDARY:
+        // easily compressed using the fastest modes
+        result.setSpeed(CompressionCodec.SpeedModifier.FASTEST)
+            .setData(CompressionCodec.DataKind.BINARY);
+        break;
+      default:
+        LOG.info("Missing ORC compression modifiers for " + kind);
+        break;
     }
     return result;
   }
@@ -308,10 +319,14 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
                                   OrcProto.Stream.Kind kind
                                   ) throws IOException {
       final StreamName name = new StreamName(column, kind);
-      CompressionCodec codec = getCustomizedCodec(kind);
-
-      return new OutStream(physicalWriter.toString(), bufferSize, codec,
-          physicalWriter.createDataStream(name));
+      CompressionCodec codec = physicalWriter.getCompressionCodec();
+      StreamOptions options = new StreamOptions(bufferSize);
+      if (codec != null) {
+        options.withCodec(codec, getCustomizedCodec(codec, compressionStrategy,
+            kind));
+      }
+      return new OutStream(physicalWriter.toString(),
+          options, physicalWriter.createDataStream(name));
     }
 
     /**
@@ -376,20 +391,37 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
       return version;
     }
 
+    /**
+     * Get the PhysicalWriter.
+     *
+     * @return the file's physical writer.
+     */
+    @Override
+    public PhysicalWriter getPhysicalWriter() {
+      return physicalWriter;
+    }
+
     public OrcFile.BloomFilterVersion getBloomFilterVersion() {
       return bloomFilterVersion;
     }
 
     public void writeIndex(StreamName name,
                            OrcProto.RowIndex.Builder index) throws IOException {
-      physicalWriter.writeIndex(name, index, getCustomizedCodec(name.getKind()));
+      physicalWriter.writeIndex(name, index);
     }
 
     public void writeBloomFilter(StreamName name,
                                  OrcProto.BloomFilterIndex.Builder bloom
                                  ) throws IOException {
-      physicalWriter.writeBloomFilter(name, bloom,
-          getCustomizedCodec(name.getKind()));
+      physicalWriter.writeBloomFilter(name, bloom);
+    }
+
+    public boolean getUseUTCTimestamp() {
+      return useUTCTimeZone;
+    }
+
+    public double getDictionaryKeySizeThreshold(int columnId) {
+      return directEncodingColumns[columnId] ? 0.0 : dictionaryKeySizeThreshold;
     }
   }
 
@@ -418,16 +450,24 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
       OrcProto.StripeFooter.Builder builder =
           OrcProto.StripeFooter.newBuilder();
       if (writeTimeZone) {
-        builder.setWriterTimezone(TimeZone.getDefault().getID());
+        if (useUTCTimeZone) {
+          builder.setWriterTimezone("UTC");
+        } else {
+          builder.setWriterTimezone(TimeZone.getDefault().getID());
+        }
       }
       OrcProto.StripeStatistics.Builder stats =
           OrcProto.StripeStatistics.newBuilder();
+
+      treeWriter.flushStreams();
       treeWriter.writeStripe(builder, stats, requiredIndexEntries);
-      fileMetadata.addStripeStats(stats.build());
+
       OrcProto.StripeInformation.Builder dirEntry =
           OrcProto.StripeInformation.newBuilder()
               .setNumberOfRows(rowsInStripe);
       physicalWriter.finalizeStripe(builder, dirEntry);
+
+      fileMetadata.addStripeStats(stats.build());
       stripes.add(dirEntry.build());
       rowCount += rowsInStripe;
       rowsInStripe = 0;
@@ -634,7 +674,7 @@ public class WriterImpl implements Writer, MemoryManager.Callback {
 
     // add the column statistics
     writeFileStatistics(builder, treeWriter);
-    return ReaderImpl.deserializeStats(builder.getStatisticsList());
+    return ReaderImpl.deserializeStats(schema, builder.getStatisticsList());
   }
 
   public CompressionCodec getCompressionCodec() {

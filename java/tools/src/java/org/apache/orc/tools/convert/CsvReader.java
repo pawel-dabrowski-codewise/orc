@@ -1,5 +1,23 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package org.apache.orc.tools.convert;
 
+import com.opencsv.CSVReader;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.hive.ql.exec.vector.BytesColumnVector;
 import org.apache.hadoop.hive.ql.exec.vector.ColumnVector;
@@ -19,16 +37,11 @@ import org.threeten.bp.ZonedDateTime;
 import org.threeten.bp.format.DateTimeFormatter;
 import org.threeten.bp.temporal.TemporalAccessor;
 
-import com.opencsv.CSVReader;
-
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 
 public class CsvReader implements RecordReader {
-  private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(
-      "yyyy[[-][/]]MM[[-][/]]dd[['T'][ ]]HH:mm:ss[ ][XXX][X]");
-
   private long rowNumber = 0;
   private final Converter converter;
   private final int columns;
@@ -36,6 +49,7 @@ public class CsvReader implements RecordReader {
   private final String nullString;
   private final FSDataInputStream underlying;
   private final long totalSize;
+  private final DateTimeFormatter dateTimeFormatter;
 
   /**
    * Create a CSV reader
@@ -49,7 +63,7 @@ public class CsvReader implements RecordReader {
    * @param escapeChar the escape character
    * @param headerLines the number of header lines
    * @param nullString the string that is translated to null
-   * @throws IOException
+   * @param timestampFormat the timestamp format string
    */
   public CsvReader(java.io.Reader reader,
                    FSDataInputStream input,
@@ -59,7 +73,8 @@ public class CsvReader implements RecordReader {
                    char quoteChar,
                    char escapeChar,
                    int headerLines,
-                   String nullString) throws IOException {
+                   String nullString,
+                   String timestampFormat) {
     this.underlying = input;
     this.reader = new CSVReader(reader, separatorChar, quoteChar, escapeChar,
         headerLines);
@@ -68,6 +83,7 @@ public class CsvReader implements RecordReader {
     IntWritable nextColumn = new IntWritable(0);
     this.converter = buildConverter(nextColumn, schema);
     this.columns = nextColumn.get();
+    this.dateTimeFormatter = DateTimeFormatter.ofPattern(timestampFormat);
   }
 
   interface Converter {
@@ -235,7 +251,7 @@ public class CsvReader implements RecordReader {
       } else {
         TimestampColumnVector vector = (TimestampColumnVector) column;
         TemporalAccessor temporalAccessor =
-            DATE_TIME_FORMATTER.parseBest(values[offset],
+            dateTimeFormatter.parseBest(values[offset],
                 ZonedDateTime.FROM, LocalDateTime.FROM);
         if (temporalAccessor instanceof ZonedDateTime) {
           vector.set(row, new Timestamp(

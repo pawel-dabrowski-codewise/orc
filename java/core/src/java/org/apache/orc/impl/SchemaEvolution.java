@@ -46,8 +46,15 @@ public class SchemaEvolution {
   private final boolean[] fileIncluded;
   private final TypeDescription fileSchema;
   private final TypeDescription readerSchema;
-  private boolean hasConversion = false;
+  private boolean hasConversion;
+  private boolean isOnlyImplicitConversion;
   private final boolean isAcid;
+  private final boolean isSchemaEvolutionCaseAware;
+  /**
+   * {@code true} if acid metadata columns should be decoded otherwise they will
+   * be set to {@code null}.  {@link #acidEventFieldNames}.
+   */
+  private final boolean includeAcidColumns;
 
   // indexed by reader column id
   private final boolean[] ppdSafeConversion;
@@ -57,23 +64,26 @@ public class SchemaEvolution {
   private static final Pattern missingMetadataPattern =
     Pattern.compile("_col\\d+");
 
+
   public static class IllegalEvolutionException extends RuntimeException {
     public IllegalEvolutionException(String msg) {
       super(msg);
     }
   }
-
   public SchemaEvolution(TypeDescription fileSchema,
                          TypeDescription readerSchema,
                          Reader.Options options) {
     boolean allowMissingMetadata = options.getTolerateMissingSchema();
     boolean[] includedCols = options.getInclude();
+    this.isSchemaEvolutionCaseAware=options.getIsSchemaEvolutionCaseAware();
     this.readerIncluded = includedCols == null ? null :
       Arrays.copyOf(includedCols, includedCols.length);
     this.fileIncluded = new boolean[fileSchema.getMaximumId() + 1];
     this.hasConversion = false;
+    this.isOnlyImplicitConversion = true;
     this.fileSchema = fileSchema;
     isAcid = checkAcidSchema(fileSchema);
+    includeAcidColumns = options.getIncludeAcidColumns();
     this.readerColumnOffset = isAcid ? acidEventFieldNames.size() : 0;
     if (readerSchema != null) {
       if (isAcid) {
@@ -183,6 +193,17 @@ public class SchemaEvolution {
     return hasConversion;
   }
 
+  /**
+   * When there Schema Evolution data type conversion i.e. hasConversion() returns true,
+   * is the conversion only the implicit kind?
+   *
+   * (see aaa).
+   * @return
+   */
+  public boolean isOnlyImplicitConversion() {
+    return isOnlyImplicitConversion;
+  }
+
   public TypeDescription getFileSchema() {
     return fileSchema;
   }
@@ -217,6 +238,59 @@ public class SchemaEvolution {
   }
 
   /**
+   * Determine if there is implicit conversion from a file to reader type.
+   *
+   * Implicit conversions are:
+   *   Small to larger integer (e.g. INT to LONG)
+   *   FLOAT to DOUBLE
+   *   Some String Family conversions.
+   *
+   * NOTE: This check is independent of the PPD conversion checks.
+   * @return
+   */
+  private boolean typesAreImplicitConversion(final TypeDescription fileType,
+      final TypeDescription readerType) {
+    switch (fileType.getCategory()) {
+    case BYTE:
+        if (readerType.getCategory().equals(TypeDescription.Category.SHORT) ||
+            readerType.getCategory().equals(TypeDescription.Category.INT) ||
+            readerType.getCategory().equals(TypeDescription.Category.LONG)) {
+          return true;
+        }
+        break;
+    case SHORT:
+        if (readerType.getCategory().equals(TypeDescription.Category.INT) ||
+            readerType.getCategory().equals(TypeDescription.Category.LONG)) {
+          return true;
+        }
+        break;
+    case INT:
+        if (readerType.getCategory().equals(TypeDescription.Category.LONG)) {
+          return true;
+        }
+        break;
+    case FLOAT:
+        if (readerType.getCategory().equals(TypeDescription.Category.DOUBLE)) {
+          return true;
+        }
+        break;
+    case CHAR:
+    case VARCHAR:
+        if (readerType.getCategory().equals(TypeDescription.Category.STRING)) {
+          return true;
+        }
+        if (readerType.getCategory().equals(TypeDescription.Category.CHAR) ||
+            readerType.getCategory().equals(TypeDescription.Category.VARCHAR)) {
+          return (fileType.getMaxLength() <= readerType.getMaxLength());
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
+  }
+
+  /**
    * Check if column is safe for ppd evaluation
    * @param colId reader column id
    * @return true if the specified column is safe for ppd evaluation else false
@@ -239,15 +313,32 @@ public class SchemaEvolution {
     boolean[] result = new boolean[readerSchema.getMaximumId() + 1];
     boolean safePpd = validatePPDConversion(fileSchema, readerSchema);
     result[readerSchema.getId()] = safePpd;
-    List<TypeDescription> children = readerSchema.getChildren();
+    return populatePpdSafeConversionForChildern(result,
+        readerSchema.getChildren());
+  }
+
+  /**
+   * Recursion to check the conversion of nested field.
+   *
+   * @param ppdSafeConversion boolean array to specify which column are safe.
+   * @param children reader schema children.
+   *
+   * @return boolean array to represent list of column safe or not.
+   */
+  private boolean[] populatePpdSafeConversionForChildern(
+                        boolean[] ppdSafeConversion,
+                        List<TypeDescription> children) {
+    boolean safePpd;
     if (children != null) {
       for (TypeDescription child : children) {
         TypeDescription fileType = getFileType(child.getId());
         safePpd = validatePPDConversion(fileType, child);
-        result[child.getId()] = safePpd;
+        ppdSafeConversion[child.getId()] = safePpd;
+        populatePpdSafeConversionForChildern(ppdSafeConversion,
+            child.getChildren());
       }
     }
-    return result;
+    return  ppdSafeConversion;
   }
 
   private boolean validatePPDConversion(final TypeDescription fileType,
@@ -316,9 +407,18 @@ public class SchemaEvolution {
    * @return true if the column should be read
    */
   public boolean includeReaderColumn(int readerId) {
-    return readerIncluded == null ||
-        readerId <= readerColumnOffset ||
-        readerIncluded[readerId - readerColumnOffset];
+    if(readerId == 0) {
+      //always want top level struct - everything is its child
+      return true;
+    }
+    if(isAcid) {
+      if(readerId < readerColumnOffset) {
+        return includeAcidColumns;
+      }
+      return readerIncluded == null ||
+          readerIncluded[readerId - readerColumnOffset];
+    }
+    return readerIncluded == null || readerIncluded[readerId];
   }
 
   /**
@@ -362,6 +462,9 @@ public class SchemaEvolution {
           // maxLength.
           if (fileType.getMaxLength() != readerType.getMaxLength()) {
             hasConversion = true;
+            if (!typesAreImplicitConversion(fileType, readerType)) {
+              isOnlyImplicitConversion = false;
+            }
           }
           break;
         case DECIMAL:
@@ -370,6 +473,7 @@ public class SchemaEvolution {
           if (fileType.getPrecision() != readerType.getPrecision() ||
               fileType.getScale() != readerType.getScale()) {
             hasConversion = true;
+            isOnlyImplicitConversion = false;
           }
           break;
         case UNION:
@@ -393,18 +497,27 @@ public class SchemaEvolution {
           List<TypeDescription> fileChildren = fileType.getChildren();
           if (fileChildren.size() != readerChildren.size()) {
             hasConversion = true;
+            // UNDONE: Does LLAP detect fewer columns and NULL them out????
+            isOnlyImplicitConversion = false;
           }
 
           if (positionalLevels == 0) {
             List<String> readerFieldNames = readerType.getFieldNames();
             List<String> fileFieldNames = fileType.getFieldNames();
-            Map<String, TypeDescription> fileTypesIdx = new HashMap<>();
+
+            final Map<String, TypeDescription> fileTypesIdx;
+            if (isSchemaEvolutionCaseAware) {
+              fileTypesIdx = new HashMap<>();
+            } else {
+              fileTypesIdx = new CaseInsensitiveMap<TypeDescription>();
+            }
             for (int i = 0; i < fileFieldNames.size(); i++) {
-              fileTypesIdx.put(fileFieldNames.get(i), fileChildren.get(i));
+              final String fileFieldName = fileFieldNames.get(i);
+              fileTypesIdx.put(fileFieldName, fileChildren.get(i));
             }
 
             for (int i = 0; i < readerFieldNames.size(); i++) {
-              String readerFieldName = readerFieldNames.get(i);
+              final String readerFieldName = readerFieldNames.get(i);
               TypeDescription readerField = readerChildren.get(i);
 
               TypeDescription fileField = fileTypesIdx.get(readerFieldName);
@@ -434,6 +547,9 @@ public class SchemaEvolution {
 
       isOk = ConvertTreeReaderFactory.canConvert(fileType, readerType);
       hasConversion = true;
+      if (!typesAreImplicitConversion(fileType, readerType)) {
+        isOnlyImplicitConversion = false;
+      }
     }
     if (isOk) {
       readerFileTypes[readerType.getId()] = fileType;
@@ -468,9 +584,15 @@ public class SchemaEvolution {
   private static boolean checkAcidSchema(TypeDescription type) {
     if (type.getCategory().equals(TypeDescription.Category.STRUCT)) {
       List<String> rootFields = type.getFieldNames();
-      if (acidEventFieldNames.equals(rootFields)) {
-        return true;
+      if (rootFields.size() != acidEventFieldNames.size()) {
+        return false;
       }
+      for (int i = 0; i < rootFields.size(); i++) {
+        if (!acidEventFieldNames.get(i).equalsIgnoreCase(rootFields.get(i))) {
+          return false;
+        }
+      }
+      return true;
     }
     return false;
   }
@@ -510,5 +632,22 @@ public class SchemaEvolution {
     acidEventFieldNames.add("rowId");
     acidEventFieldNames.add("currentTransaction");
     acidEventFieldNames.add("row");
+  }
+
+  private static class CaseInsensitiveMap<V> extends HashMap<String,V> {
+    @Override
+    public V put(String key, V value) {
+      return super.put(key.toLowerCase(), value);
+    }
+
+    @Override
+    public V get(Object key) {
+      return this.get((String) key);
+    }
+
+    // not @Override as key to be of type Object
+    public V get(String key) {
+      return super.get(key.toLowerCase());
+    }
   }
 }

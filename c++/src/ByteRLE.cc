@@ -22,13 +22,13 @@
 #include <utility>
 
 #include "ByteRLE.hh"
-#include "Exceptions.hh"
+#include "orc/Exceptions.hh"
 
 namespace orc {
 
-  const size_t MINIMUM_REPEAT = 3;
-  const size_t MAXIMUM_REPEAT = 127 + MINIMUM_REPEAT;
-  const size_t MAX_LITERAL_SIZE = 128;
+  const int MINIMUM_REPEAT = 3;
+  const int MAXIMUM_REPEAT = 127 + MINIMUM_REPEAT;
+  const int MAX_LITERAL_SIZE = 128;
 
   ByteRleEncoder::~ByteRleEncoder() {
     // PASS
@@ -37,10 +37,10 @@ namespace orc {
   class ByteRleEncoderImpl : public ByteRleEncoder {
   public:
     ByteRleEncoderImpl(std::unique_ptr<BufferedOutputStream> output);
-    virtual ~ByteRleEncoderImpl();
+    virtual ~ByteRleEncoderImpl() override;
 
     /**
-     * Encode the next batch of values
+     * Encode the next batch of values.
      * @param data to be encoded
      * @param numValues the number of values to be encoded
      * @param notNull If the pointer is null, all values are read. If the
@@ -55,8 +55,8 @@ namespace orc {
     virtual uint64_t getBufferSize() const override;
 
     /**
-     * Flushing underlying BufferedOutputStream
-    */
+     * Flush underlying BufferedOutputStream.
+     */
     virtual uint64_t flush() override;
 
     virtual void recordPosition(PositionRecorder* recorder) const override;
@@ -122,7 +122,7 @@ namespace orc {
         writeByte(
             static_cast<char>(numLiterals - static_cast<int>(MINIMUM_REPEAT)));
         writeByte(literals[0]);
-     } else {
+      } else {
         writeByte(static_cast<char>(-numLiterals));
         for (int i = 0; i < numLiterals; ++i) {
           writeByte(literals[i]);
@@ -212,7 +212,7 @@ namespace orc {
   class BooleanRleEncoderImpl : public ByteRleEncoderImpl {
   public:
     BooleanRleEncoderImpl(std::unique_ptr<BufferedOutputStream> output);
-    virtual ~BooleanRleEncoderImpl();
+    virtual ~BooleanRleEncoderImpl() override;
 
     /**
      * Encode the next batch of values
@@ -369,8 +369,8 @@ namespace orc {
     repeating = false;
     remainingValues = 0;
     value = 0;
-    bufferStart = 0;
-    bufferEnd = 0;
+    bufferStart = nullptr;
+    bufferEnd = nullptr;
   }
 
   ByteRleDecoderImpl::~ByteRleDecoderImpl() {
@@ -526,7 +526,7 @@ namespace orc {
     }
     if (consumed != 0) {
       remainingBits = 8 - consumed;
-      ByteRleDecoderImpl::next(&lastByte, 1, 0);
+      ByteRleDecoderImpl::next(&lastByte, 1, nullptr);
     }
   }
 
@@ -537,7 +537,7 @@ namespace orc {
       numValues -= remainingBits;
       uint64_t bytesSkipped = numValues / 8;
       ByteRleDecoderImpl::skip(bytesSkipped);
-      ByteRleDecoderImpl::next(&lastByte, 1, 0);
+      ByteRleDecoderImpl::next(&lastByte, 1, nullptr);
       remainingBits = 8 - (numValues % 8);
     }
   }
@@ -585,7 +585,7 @@ namespace orc {
     } else if (position < numValues) {
       // read the new bytes into the array
       uint64_t bytesRead = (nonNulls + 7) / 8;
-      ByteRleDecoderImpl::next(data + position, bytesRead, 0);
+      ByteRleDecoderImpl::next(data + position, bytesRead, nullptr);
       lastByte = data[position + bytesRead - 1];
       remainingBits = bytesRead * 8 - nonNulls;
       // expand the array backwards so that we don't clobber the data
